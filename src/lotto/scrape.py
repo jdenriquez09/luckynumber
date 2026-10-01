@@ -126,6 +126,63 @@ def _parse_jackpot(raw: str) -> float | None:
         return None
 
 
+def _parse_winner_table(soup, game_cfg: "GameConfig") -> dict[str, int]:
+    """
+    Parse the 6-column jackpot-winners table on lottopcso.com pages.
+    Returns {date_iso: winner_count} filtered to the given game.
+    Table headers: Date | Draw | Combination | Jackpot | Location | Winner
+    The "Draw" column contains a game label like "6/49" or "6/42".
+    """
+    # Build a set of game label fragments that match game_cfg
+    # e.g. game_cfg.id "649" → look for "6/49" in the Draw cell
+    picks_str = game_cfg.id  # "649", "655", "658", ...
+    # Convert "649" → "6/49", "655" → "6/55", etc.
+    game_label_variants: set[str] = set()
+    if picks_str.isdigit() and len(picks_str) == 3:
+        game_label_variants.add(picks_str[0] + "/" + picks_str[1:])  # "6/49"
+        game_label_variants.add(picks_str)
+    else:
+        game_label_variants.add(picks_str.lower())
+
+    winners_by_date: dict[str, int] = {}
+    for tbl in soup.find_all("table"):
+        header_row = tbl.find("tr")
+        if not header_row:
+            continue
+        headers = [th.get_text(" ", strip=True).lower()
+                   for th in header_row.find_all(["th", "td"])]
+        # Must have 'date', 'combination', 'draw', and 'winner' columns
+        if not (any("date" in h for h in headers)
+                and any("combination" in h for h in headers)
+                and any("winner" in h for h in headers)):
+            continue
+        # Find column indices
+        date_idx = next((i for i, h in enumerate(headers) if "date" in h), 0)
+        draw_idx = next((i for i, h in enumerate(headers) if h == "draw"), None)
+        winner_idx = next((i for i, h in enumerate(headers) if "winner" in h), -1)
+        if winner_idx < 0:
+            continue
+        for tr in tbl.find_all("tr")[1:]:
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cells) <= winner_idx:
+                continue
+            # Filter to matching game if "draw" column exists
+            if draw_idx is not None and draw_idx < len(cells):
+                cell_game = cells[draw_idx].strip()
+                if not any(v in cell_game for v in game_label_variants):
+                    continue
+            d = _parse_date(cells[date_idx])
+            if d is None:
+                continue
+            try:
+                count = int(re.sub(r"[^\d]", "", cells[winner_idx]) or "0")
+            except (ValueError, TypeError):
+                count = 0
+            iso = d.isoformat()
+            winners_by_date[iso] = winners_by_date.get(iso, 0) + count
+    return winners_by_date
+
+
 def parse_pick6_page(html: str, game_cfg: GameConfig) -> list[dict[str, Any]]:
     """
     Parse a lottopcso.com yearly history page for a pick-6 game.
@@ -133,6 +190,11 @@ def parse_pick6_page(html: str, game_cfg: GameConfig) -> list[dict[str, Any]]:
     """
     soup = BeautifulSoup(html, "lxml")
     rows: list[dict[str, Any]] = []
+
+    # Build jackpot winner lookup from the 6-column winners table.
+    # If the table is present (has entries), draws missing from it had 0 jackpot winners.
+    jackpot_winners = _parse_winner_table(soup, game_cfg)
+    has_winner_table = bool(jackpot_winners)
 
     # Only parse tables whose header row is exactly:
     # "Draw Date" | "Winning Numbers" | "Jackpot ..."
@@ -174,6 +236,7 @@ def parse_pick6_page(html: str, game_cfg: GameConfig) -> list[dict[str, Any]]:
                 "game": game_cfg.id,
                 "draw_time": None,
                 "jackpot_php": _parse_jackpot(raw_jackpot),
+                "winners_jackpot": jackpot_winners.get(draw_date.isoformat(), 0 if has_winner_table else None),
                 "notes": None,
             }
             for i, n in enumerate(pub_nums, 1):
@@ -328,6 +391,7 @@ def _parse_pcso_gov_results(html: str) -> list[dict[str, Any]]:
         combo = cells[1].strip()
         date_str = cells[2].strip()
         jackpot_str = cells[3].strip() if len(cells) > 3 else ""
+        winners_str = cells[4].strip() if len(cells) > 4 else ""
 
         draw_date = _parse_date(date_str)
         if not draw_date:
@@ -337,12 +401,20 @@ def _parse_pcso_gov_results(html: str) -> list[dict[str, Any]]:
         nums = re.findall(r"\d{1,3}", combo)
         pub_nums = [int(n) for n in nums[:game_cfg.picks]] if len(nums) >= game_cfg.picks else []
 
+        winners_jackpot: int | None = None
+        if winners_str:
+            try:
+                winners_jackpot = int(re.sub(r"[^\d]", "", winners_str) or "0") or None
+            except (ValueError, TypeError):
+                pass
+
         row: dict[str, Any] = {
             "draw_date": draw_date.isoformat(),
             "weekday": draw_date.strftime("%a"),
             "game": game_id,
             "draw_time": _extract_draw_time(game_name_lower),
             "jackpot_php": _parse_jackpot(jackpot_str),
+            "winners_jackpot": winners_jackpot,
             "notes": None,
         }
         for i, n in enumerate(pub_nums, 1):

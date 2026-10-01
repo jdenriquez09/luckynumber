@@ -1,12 +1,14 @@
 import sys
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from api.db import get_connection
 from src.lotto.games import GAMES
 import src.lotto.analysis as an
 import src.lotto.predict as pred
+import src.lotto.lean_ml as lean_ml
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
@@ -32,71 +34,56 @@ def list_tests() -> dict:
     return {"pick6": list(_PICK6_TESTS.keys()), "digit": list(_DIGIT_TESTS.keys())}
 
 
-@router.get("/{game_id}/{test_name}")
-def run_analysis(game_id: str, test_name: str) -> dict:
-    game_cfg = GAMES.get(game_id.lower())
-    if game_cfg is None:
-        raise HTTPException(404, f"Game '{game_id}' not found")
-
-    if game_cfg.ordered:
-        func = _DIGIT_TESTS.get(test_name)
-    else:
-        func = _PICK6_TESTS.get(test_name)
-
-    if func is None:
-        raise HTTPException(404, f"Test '{test_name}' not available for game '{game_id}'")
-
-    conn = get_connection(read_only=True)
-    num_cols = ", ".join(f"n{i}" for i in range(1, game_cfg.picks + 1))
-    df = conn.execute(f"""
-        SELECT draw_date, weekday, game, draw_time,
-               pub_1, pub_2, pub_3, pub_4, pub_5, pub_6,
-               {num_cols}, jackpot_php, notes
-        FROM draws WHERE game = ?
-        ORDER BY draw_date
-    """, [game_cfg.id]).fetchdf()
-    conn.close()
-
-    if df.empty:
-        raise HTTPException(404, f"No draw data for game '{game_id}'")
-
-    try:
-        result = func(df, game_cfg)
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
-
-    return {
-        "game": game_cfg.id,
-        "test": result.name,
-        "conclusion": result.conclusion,
-        "table": result.table.to_dict(orient="records"),
-        "meta": result.meta,
-    }
-
-
 def _load_draws(game_cfg) -> "pd.DataFrame":
     import pandas as pd
     conn = get_connection(read_only=True)
-    num_cols = ", ".join(f"n{i}" for i in range(1, game_cfg.picks + 1))
-    df = conn.execute(f"""
-        SELECT draw_date, weekday, game, draw_time,
-               pub_1, pub_2, pub_3, pub_4, pub_5, pub_6,
-               {num_cols}, jackpot_php, notes
-        FROM draws WHERE game = ?
-        ORDER BY draw_date
-    """, [game_cfg.id]).fetchdf()
-    conn.close()
+    try:
+        num_cols = ", ".join(f"n{i}" for i in range(1, game_cfg.picks + 1))
+        df = conn.execute(f"""
+            SELECT draw_date, weekday, game, draw_time,
+                   pub_1, pub_2, pub_3, pub_4, pub_5, pub_6,
+                   {num_cols}, jackpot_php, notes
+            FROM draws WHERE game = ?
+            ORDER BY draw_date, draw_time
+        """, [game_cfg.id]).fetchdf()
+    finally:
+        conn.close()
     return df
+
+
+def _generate(df, game_cfg, *, method, n, window, draw_time) -> dict:
+    """Use the same seeded local generation for displayed tickets and AI context."""
+    if method == "ml":
+        return lean_ml.generate_ml_combinations(
+            df, game_cfg, n=n, window=window, draw_time=draw_time, seed=42,
+        )
+    return {
+        "method": "uniform_fallback",
+        "combinations": pred.suggest_combinations(
+            df, game_cfg, n=n, window=window, draw_time=draw_time, seed=42,
+        ),
+        "scores": [], "feature_weights": {}, "training_draws": 0,
+        "reason": "Uniform requested; no model was trained or evaluated.",
+        "evaluation": {"status": "not_requested", "test_draws": 0,
+                       "evidence_of_improvement": False},
+    }
 
 
 @router.get("/{game_id}/probability")
 def get_probability(
     game_id: str,
-    window: int | None = Query(default=None, description="Limit to last N draws; omit for all"),
+    window: int | None = Query(default=None, gt=0, description="Limit to last N draws; omit for all"),
     n_suggestions: int = Query(default=5, ge=1, le=20),
     draw_time: str | None = Query(default=None, description="Filter to a specific draw time, e.g. '14:00'"),
+    method: Literal["ml", "uniform"] = Query(default="ml"),
 ) -> dict:
-    """Return per-number heat map scores and weighted-random combination suggestions."""
+    """Return historical heat maps and seeded local generation metadata.
+
+    For multi-slot ML requests without draw_time, by_draw_time maps each
+    scheduled slot present in history to its generation (n_suggestions each).
+    Top-level suggestions is empty and generation is null: no pooled model or
+    implicit slot selection. Supply draw_time for one slot's suggestions.
+    """
     game_cfg = GAMES.get(game_id.lower())
     if game_cfg is None:
         raise HTTPException(404, f"Game '{game_id}' not found")
@@ -106,7 +93,18 @@ def get_probability(
         raise HTTPException(404, f"No draw data for game '{game_id}'")
 
     heat = pred.number_heat_map(df, game_cfg, window=window, draw_time=draw_time)
-    combos = pred.suggest_combinations(df, game_cfg, n=n_suggestions, window=window, draw_time=draw_time)
+    by_draw_time = {}
+    generation = None
+    if method == "ml" and len(game_cfg.draw_times) > 1 and draw_time is None:
+        for dt in game_cfg.draw_times:
+            if df["draw_time"].eq(dt).any():
+                by_draw_time[dt] = _generate(
+                    df, game_cfg, method=method, n=n_suggestions, window=window, draw_time=dt,
+                )
+    else:
+        generation = _generate(
+            df, game_cfg, method=method, n=n_suggestions, window=window, draw_time=draw_time,
+        )
     summary = pred.heat_map_summary(heat)
 
     total = int((df["draw_time"] == draw_time).sum()) if draw_time else len(df)
@@ -118,13 +116,17 @@ def get_probability(
         "window": window,
         "disclaimer": pred.DISCLAIMER,
         "heat_map": heat.to_dict(orient="records"),
-        "suggestions": combos,
+        "suggestions": generation["combinations"] if generation is not None else [],
+        "generation": generation,
+        "by_draw_time": by_draw_time,
         "summary": summary,
     }
 
 
 class AISummaryRequest(BaseModel):
-    window: int | None = None
+    window: int | None = Field(default=None, gt=0)
+    method: Literal["ml", "uniform"] = "ml"
+    n_suggestions: int = Field(default=5, ge=1, le=20)
 
 
 @router.post("/{game_id}/ai_summary")
@@ -145,29 +147,47 @@ def get_ai_summary(game_id: str, body: AISummaryRequest = AISummaryRequest()) ->
         raise HTTPException(404, f"No draw data for game '{game_id}'")
 
     _TIME_LABELS = {"14:00": "2:00 PM", "17:00": "5:00 PM", "21:00": "9:00 PM"}
-    is_multi = len(game_cfg.draw_times) > 1
+    slots_data = []
+    for dt in game_cfg.draw_times:
+        slot_df = df[df["draw_time"] == dt]
+        if slot_df.empty:
+            continue
 
-    if is_multi:
-        slots_data = [
-            {
-                "label": _TIME_LABELS.get(dt, dt),
-                "heat_map_rows": pred.number_heat_map(df, game_cfg, window=body.window, draw_time=dt).to_dict(orient="records"),
-                "total_draws": int((df["draw_time"] == dt).sum()),
-            }
-            for dt in game_cfg.draw_times
-        ]
+        if game_cfg.ordered:
+            heat_df = slot_df.tail(body.window) if body.window is not None else slot_df
+            position_heat = pred.position_heat_map(heat_df, game_cfg)
+            heat_map_rows = [
+                {"number": int(row["digit"]), "position": int(position),
+                 "total_draws": int(row["count"])}
+                for position, heat in position_heat.items()
+                for row in heat.to_dict(orient="records")
+            ]
+        else:
+            heat = pred.number_heat_map(slot_df, game_cfg, window=body.window)
+            heat_map_rows = heat.to_dict(orient="records")
+
+        if not heat_map_rows:
+            continue
+        generation = _generate(
+            df, game_cfg, method=body.method, n=body.n_suggestions,
+            window=body.window, draw_time=dt,
+        )
+        slots_data.append({
+            "label": _TIME_LABELS.get(dt, dt),
+            "heat_map_rows": heat_map_rows,
+            "total_draws": min(len(slot_df), body.window) if game_cfg.ordered and body.window is not None else len(slot_df),
+            "generation": generation,
+        })
+
+    if not slots_data:
+        raise HTTPException(404, f"No draw data for game '{game_id}'")
+
+    if game_cfg.ordered:
+        chi_result = an.digit_uniformity(df, game_cfg).conclusion
+        gap_result = an.digit_repeat_rate(df, game_cfg).conclusion
     else:
-        heat = pred.number_heat_map(df, game_cfg, window=body.window)
-        slots_data = [
-            {
-                "label": _TIME_LABELS.get(game_cfg.draw_times[0], "9:00 PM"),
-                "heat_map_rows": heat.to_dict(orient="records"),
-                "total_draws": len(df),
-            }
-        ]
-
-    chi_result = an.freq_chi_square(df, game_cfg).conclusion
-    gap_result = an.gap_analysis(df, game_cfg).conclusion
+        chi_result = an.freq_chi_square(df, game_cfg).conclusion
+        gap_result = an.gap_analysis(df, game_cfg).conclusion
 
     try:
         results = ai.interpret_lotto_stats(
@@ -184,4 +204,49 @@ def get_ai_summary(game_id: str, body: AISummaryRequest = AISummaryRequest()) ->
         "game": game_cfg.id,
         "results": results,
         "disclaimer": pred.DISCLAIMER,
+    }
+
+
+# Register the generic route after named routes so it cannot shadow probability.
+@router.get("/{game_id}/{test_name}")
+def run_analysis(game_id: str, test_name: str) -> dict:
+    game_cfg = GAMES.get(game_id.lower())
+    if game_cfg is None:
+        raise HTTPException(404, f"Game '{game_id}' not found")
+
+    if game_cfg.ordered:
+        func = _DIGIT_TESTS.get(test_name)
+    else:
+        func = _PICK6_TESTS.get(test_name)
+
+    if func is None:
+        raise HTTPException(404, f"Test '{test_name}' not available for game '{game_id}'")
+
+    conn = get_connection(read_only=True)
+    try:
+        num_cols = ", ".join(f"n{i}" for i in range(1, game_cfg.picks + 1))
+        df = conn.execute(f"""
+            SELECT draw_date, weekday, game, draw_time,
+                   pub_1, pub_2, pub_3, pub_4, pub_5, pub_6,
+                   {num_cols}, jackpot_php, notes
+            FROM draws WHERE game = ?
+            ORDER BY draw_date
+        """, [game_cfg.id]).fetchdf()
+    finally:
+        conn.close()
+
+    if df.empty:
+        raise HTTPException(404, f"No draw data for game '{game_id}'")
+
+    try:
+        result = func(df, game_cfg)
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+    return {
+        "game": game_cfg.id,
+        "test": result.name,
+        "conclusion": result.conclusion,
+        "table": result.table.to_dict(orient="records"),
+        "meta": result.meta,
     }

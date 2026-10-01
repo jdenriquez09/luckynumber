@@ -35,7 +35,9 @@ def _fair_draws(game_cfg: GameConfig, n: int = 200, seed: int = 0) -> pd.DataFra
     while count < n:
         abbr = d.strftime("%a")
         if abbr in draw_days:
-            nums = sorted(rng.choice(pool, size=game_cfg.picks, replace=not game_cfg.ordered).tolist())
+            nums = rng.choice(pool, size=game_cfg.picks, replace=game_cfg.ordered).tolist()
+            if not game_cfg.ordered:
+                nums.sort()
             row = {"draw_date": d.isoformat(), "weekday": abbr, "game": game_cfg.id,
                    "draw_time": "21:00", "jackpot_php": 50_000_000.0, "notes": None}
             for i, v in enumerate(nums, 1):

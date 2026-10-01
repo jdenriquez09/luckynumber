@@ -17,7 +17,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from api.db import get_connection
+from api.db import get_connection, compare_with_actual
 from src.lotto.games import GAMES
 import src.lotto.analysis as an
 from src.lotto.clean import completeness_report
@@ -34,7 +34,7 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 
 def _query(sql: str, params: list | None = None) -> pd.DataFrame:
-    conn = get_connection(read_only=True)
+    conn = get_connection()
     try:
         result = conn.execute(sql, params or []).fetchdf()
     finally:
@@ -42,7 +42,12 @@ def _query(sql: str, params: list | None = None) -> pd.DataFrame:
     return result
 
 
-_INT_COLS = [f"pub_{i}" for i in range(1, 7)] + [f"n{i}" for i in range(1, 7)]
+_INT_COLS = (
+    [f"pub_{i}" for i in range(1, 7)]
+    + [f"n{i}" for i in range(1, 7)]
+    + ["winners_jackpot", "winners_5match", "winners_4match", "winners_3match",
+       "draw_sum", "odd_count", "high_count", "consecutive_cnt", "number_spread"]
+)
 
 @st.cache_data(ttl=30)
 def load_draws(game_id: str) -> pd.DataFrame:
@@ -51,16 +56,45 @@ def load_draws(game_id: str) -> pd.DataFrame:
     df = _query(f"""
         SELECT draw_date, weekday, game, draw_time,
                pub_1, pub_2, pub_3, pub_4, pub_5, pub_6,
-               {num_cols}, jackpot_php, notes
+               {num_cols}, jackpot_php, notes,
+               draw_sum, odd_count, high_count, consecutive_cnt, number_spread,
+               is_rollover, covid_gap,
+               winners_jackpot, winners_5match, winners_4match, winners_3match
         FROM draws WHERE game = ?
         ORDER BY draw_date DESC
     """, [game_id])
     # Cast number columns from float64 (pandas default with NULLs) to Int64
-    # so they display as integers (e.g. "15") not floats ("15.000000")
     for col in _INT_COLS:
         if col in df.columns:
             df[col] = df[col].astype("Int64")
     return df
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def _prob_generation(_df: pd.DataFrame, dataset_hash: str, game_id: str,
+                     window: int | None, draw_time: str, n: int,
+                     mode: str, model_version: str) -> dict:
+    """Cache per-slot tickets/metrics; explicit snapshot and version key _df."""
+    from src.lotto.lean_ml import generate_ml_combinations, _prepare_draws
+    from src.lotto.predict import random_combinations
+
+    cfg = GAMES[game_id]
+    if mode == "ML-assisted":
+        return generate_ml_combinations(
+            _df, cfg, n=n, window=window, draw_time=draw_time, seed=42,
+        )
+    return {
+        "method": "uniform_fallback",
+        "combinations": random_combinations(cfg, n=n, seed=42),
+        "scores": [], "feature_weights": {}, "training_draws": 0,
+        "reason": "Uniform random selected; no model was trained or evaluated.",
+        "evaluation": {
+            "status": "not_requested", "test_draws": 0,
+            "usable_draws": len(_prepare_draws(_df, cfg, window, draw_time)),
+            "model_brier": None, "baseline_brier": None, "brier_skill": None,
+            "improvement_ci95": [], "evidence_of_improvement": False,
+        },
+    }
 
 
 def game_selector(label: str = "Game") -> str:
@@ -71,24 +105,30 @@ def game_selector(label: str = "Game") -> str:
 
 def _show_interp(template_msg: str, key_facts: str, game_name: str,
                  chart_name: str, cache_key: str) -> None:
-    """Show chart interpretation — AI text if cached, else template + AI button."""
+    """Show chart interpretation — AI text if cached for current data, else template + AI button.
+
+    The actual session_state key is versioned with the latest draw date so that
+    when new draws are scraped the old AI text is automatically replaced by the
+    template (and a fresh AI call can be triggered).
+    """
     from src.lotto.azure_ai import AzureAIClient as _AIC
     _ai = _AIC()
+    requested = _ai.is_configured() and st.button(
+        "Generate / Regenerate AI explanation", key=f"regen_{cache_key}"
+    )
+    if requested:
+        st.session_state.pop(cache_key, None)
     if cache_key in st.session_state:
         st.info(st.session_state[cache_key])
-        if st.button("🔄 Regenerate AI explanation", key=f"regen_{cache_key}"):
-            del st.session_state[cache_key]
-            st.rerun()
-    elif _ai.is_configured():
-        st.info(template_msg)
-        if st.button("🤖 Explain in plain language (AI)", key=f"aibtn_{cache_key}"):
-            with st.spinner("Asking AI to explain this in plain language…"):
-                try:
-                    explanation = _ai.explain_chart(game_name, chart_name, key_facts)
-                    st.session_state[cache_key] = explanation
-                    st.rerun()
-                except Exception as _e:
-                    st.error(f"AI error: {_e}")
+    elif requested:
+        with st.spinner("AI is analysing this chart…"):
+            try:
+                explanation = _ai.explain_chart(game_name, chart_name, key_facts)
+                st.session_state[cache_key] = explanation
+                st.rerun()
+            except Exception as _e:
+                st.info(template_msg)
+                st.error(f"AI error: {_e}")
     else:
         st.info(template_msg)
 
@@ -100,7 +140,7 @@ def _show_interp(template_msg: str, key_facts: str, game_name: str,
 PAGES = [
     "Raw Data", "Frequency Analysis", "Statistical Tests", "Completeness",
     "Probability & AI", "Backtest", "Advanced Stats", "Combo Tools",
-    "Gambler's Edge", "Data Quality",
+    "Gambler's Edge", "Data Quality", "Saved Combos",
 ]
 page = st.sidebar.radio("Navigate", PAGES)
 
@@ -109,7 +149,7 @@ st.sidebar.markdown("---")
 # ---- Quick Update button ----
 def _get_last_dates() -> dict[str, str]:
     """Return {game_id: last_draw_date_iso} for all games that have data."""
-    conn = get_connection(read_only=True)
+    conn = get_connection()
     try:
         rows = conn.execute("""
             SELECT game, MAX(draw_date) AS last_date
@@ -142,7 +182,10 @@ else:
 
 _update_disabled = _days_behind <= 0
 
-if st.sidebar.button(
+# Auto-update: trigger scrape automatically when data is stale
+_auto_update = _days_behind > 0 and "_auto_updated" not in st.session_state
+
+if _auto_update or st.sidebar.button(
     "🔄 Update Data (all games)",
     disabled=_update_disabled,
     help="Scrape new draws from the day after the last recorded draw up to today.",
@@ -161,6 +204,7 @@ if st.sidebar.button(
         _from_date = _today_upd - _dt_mod.timedelta(days=30)
 
     if _from_date > _today_upd:
+        st.session_state["_auto_updated"] = True
         st.sidebar.success("Already up to date — nothing to fetch.")
     else:
         _prog = st.sidebar.empty()
@@ -183,8 +227,12 @@ if st.sidebar.button(
                         _game_summary.append(f"**{GAMES[_gid].name}**: +{_ins} draw(s)")
             _conn_w.close()
             st.cache_data.clear()
+            # Clear ALL cached AI results and ML models
+            for _sk in [k for k in st.session_state if k.startswith(("ai_", "ml_"))]:
+                del st.session_state[_sk]
             _prog.empty()
 
+            st.session_state["_auto_updated"] = True
             if _total_ins:
                 st.sidebar.success(
                     f"✅ Updated! **{_total_ins} new draw(s)** added across "
@@ -193,8 +241,21 @@ if st.sidebar.button(
             else:
                 st.sidebar.info("No new draws found — data is already current.")
         except Exception as _upd_exc:
+            st.session_state["_auto_updated"] = True
             _prog.empty()
             st.sidebar.error(f"Update failed: {_upd_exc}")
+
+# Manual AI + ML cache clear
+_n_cached = sum(1 for k in st.session_state if k.startswith(("ai_", "ml_")))
+if _n_cached:
+    if st.sidebar.button(
+        f"🧹 Clear AI/ML Cache ({_n_cached} stored)",
+        help="Remove all cached AI results, chart interpretations, and ML models.",
+        use_container_width=True,
+    ):
+        for _k in [k for k in st.session_state if k.startswith(("ai_", "ml_"))]:
+            del st.session_state[_k]
+        st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -208,10 +269,15 @@ with st.sidebar.expander("Load Data (custom range)"):
     )
 
     if scrape_source == "pcso.gov.ph (official)":
+        st.caption("pcso.gov.ph has data from 2016 onwards. For earlier years use **Load Historical Data** below.")
         _today = _dt_mod.date.today()
-        _jan1 = _today.replace(month=1, day=1)
-        pcso_from = st.date_input("From", value=_jan1, key="pcso_from")
-        pcso_to = st.date_input("To", value=_today, key="pcso_to")
+        _jan1 = _dt_mod.date(2016, 1, 1)
+        pcso_from = st.date_input("From", value=_jan1,
+                                   min_value=_dt_mod.date(2016, 1, 1),
+                                   max_value=_today, key="pcso_from")
+        pcso_to = st.date_input("To", value=_today,
+                                 min_value=_dt_mod.date(2016, 1, 1),
+                                 max_value=_today, key="pcso_to")
 
         if st.button("Scrape (all games)", key="scrape_pcso_btn"):
             import asyncio
@@ -243,7 +309,7 @@ with st.sidebar.expander("Load Data (custom range)"):
                                    key="scrape_game_sel")
         current_year = _dt_mod.datetime.now().year
         scrape_years = st.multiselect(
-            "Years", list(range(2021, current_year + 1)),
+            "Years", list(range(1995, current_year + 1)),
             default=[current_year], key="scrape_years_sel"
         )
         if st.button("Scrape now", key="scrape_btn"):
@@ -260,6 +326,172 @@ with st.sidebar.expander("Load Data (custom range)"):
             st.success(f"Done — {ins} rows loaded, {flg} flagged.")
 
 st.sidebar.markdown("---")
+
+# ---- Historical data loader (any year range) ----
+with st.sidebar.expander("Load Historical Data"):
+    st.caption(
+        "Scrape any year range for pick-6 games via lottopcso.com. "
+        "Covers data from game inception to the present."
+    )
+    from src.lotto.migrate import GAME_START_YEARS as _GAME_START_YEARS
+    import asyncio as _asyncio
+    from src.lotto.migrate import scrape_historical as _scrape_hist
+
+    _hist_pick6_games = {gid: g for gid, g in GAMES.items() if not g.ordered}
+
+    _hist_scope = st.radio(
+        "Scope", ["All pick-6 games", "Single game"], key="hist_scope_sel"
+    )
+
+    if _hist_scope == "Single game":
+        _hist_game = st.selectbox(
+            "Game", list(_hist_pick6_games.keys()),
+            format_func=lambda k: _hist_pick6_games[k].name,
+            key="hist_game_sel",
+        )
+        _hist_games_to_run = {_hist_game: _hist_pick6_games[_hist_game]}
+        _default_start = _GAME_START_YEARS.get(_hist_game, 2010)
+    else:
+        _hist_game = None
+        _hist_games_to_run = _hist_pick6_games
+        _default_start = min(_GAME_START_YEARS.get(gid, 2010) for gid in _hist_pick6_games)
+
+    _hist_cur_year = _dt_mod.datetime.now().year
+    _hist_from = st.number_input(
+        "From year", min_value=1990, max_value=_hist_cur_year,
+        value=int(_default_start), step=1, key="hist_from_yr"
+    )
+    _hist_to = st.number_input(
+        "To year", min_value=1990, max_value=_hist_cur_year,
+        value=_hist_cur_year, step=1, key="hist_to_yr"
+    )
+
+    if st.button("Load Historical Draws", key="hist_scrape_btn"):
+        _hist_status = st.empty()
+        _hist_grand_total = 0
+        _hist_games_done = 0
+
+        for _hgid, _hgcfg in _hist_games_to_run.items():
+            _game_launch = _GAME_START_YEARS.get(_hgid, int(_hist_from))
+            _eff_from = max(int(_hist_from), _game_launch)
+            if _eff_from > int(_hist_to):
+                continue
+            _hist_status.info(
+                f"Scraping {_hgcfg.name} ({_eff_from}–{int(_hist_to)})… "
+                f"({_hist_games_done}/{len(_hist_games_to_run)} done)"
+            )
+            try:
+                _hist_result = _asyncio.run(
+                    _scrape_hist(_hgid, from_year=_eff_from, to_year=int(_hist_to))
+                )
+                _hist_grand_total += _hist_result["total_inserted"]
+                _hist_games_done += 1
+            except Exception as _he:
+                st.warning(f"{_hgcfg.name}: {_he}")
+                _hist_games_done += 1
+
+        st.cache_data.clear()
+        _hist_status.empty()
+        st.success(
+            f"Done — **{_hist_grand_total} rows** loaded "
+            f"across {_hist_games_done} game(s)."
+        )
+
+# ---- Kaggle dataset importer ----
+with st.sidebar.expander("Import from Kaggle"):
+    st.caption(
+        "Load pre-2016 PCSO draw data from a Kaggle dataset. "
+        "Requires a Kaggle account and API key (~/.kaggle/kaggle.json)."
+    )
+    _kg_handle = st.text_input(
+        "Dataset handle",
+        value="harrychristian/pcso-lottery-results-philippines",
+        key="kg_handle",
+    )
+    _kg_file = st.text_input(
+        "File path (leave blank to auto-detect)",
+        value="",
+        key="kg_file",
+    )
+    _kg_col1, _kg_col2 = st.columns(2)
+    if _kg_col1.button("🔍 Inspect columns", key="kg_inspect_btn"):
+        try:
+            from src.lotto.kaggle_import import inspect_kaggle_dataset as _kginspect
+            with st.spinner("Loading dataset preview…"):
+                _kg_df = _kginspect(_kg_handle, _kg_file)
+            st.write("**Shape:**", _kg_df.shape)
+            st.write("**Columns:**", list(_kg_df.columns))
+            st.dataframe(_kg_df.head(5), use_container_width=True)
+        except Exception as _kge:
+            st.error(f"Inspect failed: {_kge}")
+
+    if _kg_col2.button("⬇️ Import", key="kg_import_btn"):
+        try:
+            from src.lotto.kaggle_import import import_kaggle_dataset as _kgimport
+            with st.spinner("Downloading and importing Kaggle dataset…"):
+                _conn_kg = get_connection()
+                _kg_ins, _kg_skip = _kgimport(_kg_handle, _kg_file, conn=_conn_kg)
+                _conn_kg.close()
+                st.cache_data.clear()
+            st.success(
+                f"✅ **{_kg_ins} rows** inserted, {_kg_skip} skipped (duplicates/invalid)."
+            )
+        except Exception as _kge:
+            st.error(f"Import failed: {_kge}")
+
+# ---- CSV file uploader ----
+with st.sidebar.expander("Import from CSV"):
+    st.caption(
+        "Upload a CSV file with columns: "
+        "LOTTO GAME, COMBINATIONS, DRAW DATE, JACKPOT (PHP), WINNERS"
+    )
+    _csv_file = st.file_uploader("Choose CSV file", type=["csv"], key="csv_upload")
+    if _csv_file is not None:
+        if st.button("⬆️ Import CSV", key="csv_import_btn"):
+            import tempfile, os
+            try:
+                from src.lotto.kaggle_import import import_csv_file as _csv_import
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as _tmp:
+                    _tmp.write(_csv_file.getvalue())
+                    _tmp_path = _tmp.name
+                with st.spinner("Importing CSV…"):
+                    _conn_csv = get_connection()
+                    _csv_ins, _csv_skip = _csv_import(_tmp_path, conn=_conn_csv)
+                    _conn_csv.close()
+                    st.cache_data.clear()
+                os.unlink(_tmp_path)
+                st.success(
+                    f"✅ **{_csv_ins} rows** inserted, {_csv_skip} skipped (duplicates/invalid)."
+                )
+            except Exception as _csve:
+                st.error(f"Import failed: {_csve}")
+
+# ---- Backfill derived columns ----
+with st.sidebar.expander("Compute Derived Stats"):
+    st.caption(
+        "Populate draw_sum, odd_count, high_count, etc. for all existing rows. "
+        "Run once after loading data or after a schema upgrade."
+    )
+    _bf_game_opts = ["All games"] + [f"{gid} — {g.name}" for gid, g in GAMES.items()]
+    _bf_selection = st.selectbox("Scope", _bf_game_opts, key="bf_game_sel")
+    if st.button("Run Backfill", key="bf_run_btn"):
+        from src.lotto.migrate import add_derived_columns as _add_cols, backfill_derived_columns as _bfd
+        _bf_game_id = None if _bf_selection == "All games" else _bf_selection.split(" — ")[0]
+        with st.spinner("Backfilling…"):
+            try:
+                _conn_bf = get_connection()
+                _added = _add_cols(_conn_bf)
+                _bf_res = _bfd(_conn_bf, game=_bf_game_id)
+                _conn_bf.close()
+                st.cache_data.clear()
+                _msg = f"✅ **{_bf_res.get('rows_updated', 0)} rows** updated."
+                if _added:
+                    _msg += f" New columns: {', '.join(_added)}."
+                st.success(_msg)
+            except Exception as _bfe:
+                st.error(f"Backfill failed: {_bfe}")
+
+st.sidebar.markdown("---")
 st.sidebar.caption(
     "This dashboard tests whether PCSO draws are statistically consistent "
     "with a fair random process. It does NOT predict future draws."
@@ -274,11 +506,15 @@ if page == "Raw Data":
     game_id = game_selector()
     game_cfg = GAMES[game_id]
 
+    _rd_min = _dt_mod.date(1995, 1, 1)
+    _rd_max = _dt_mod.date.today()
     col1, col2 = st.columns(2)
     with col1:
-        from_date = st.date_input("From date", value=None)
+        from_date = st.date_input("From date", value=None,
+                                   min_value=_rd_min, max_value=_rd_max)
     with col2:
-        to_date = st.date_input("To date", value=None)
+        to_date = st.date_input("To date", value=None,
+                                 min_value=_rd_min, max_value=_rd_max)
 
     df = load_draws(game_id)
 
@@ -299,6 +535,11 @@ if page == "Raw Data":
         lambda x: f"{x:,.2f}" if pd.notna(x) else ""
     )
 
+    # Fill NULL winner counts with 0 for consistent display
+    for _wc in ["winners_jackpot", "winners_5match", "winners_4match", "winners_3match"]:
+        if _wc in display_df.columns:
+            display_df[_wc] = display_df[_wc].fillna(0)
+
     def _style_rows(row: pd.Series) -> list[str]:
         has_note = bool(row.get("notes")) and str(row.get("notes", "")).strip() not in ("", "None", "nan")
         if has_note:
@@ -317,8 +558,14 @@ if page == "Raw Data":
         if c in display_df.columns:
             col_cfg[c] = st.column_config.NumberColumn(c, format="%d", width="small")
 
+    _MAX_STYLED_CELLS = 262144
+    _use_style = (len(display_df) * len(display_df.columns)) <= _MAX_STYLED_CELLS
+    _render_df = display_df.style.apply(_style_rows, axis=1) if _use_style else display_df
+    if not _use_style and len(flagged):
+        st.info("Row highlighting disabled for large datasets (too many cells for Pandas Styler). Use 'Show flagged rows only' to inspect flagged draws.")
+
     st.dataframe(
-        display_df.style.apply(_style_rows, axis=1),
+        _render_df,
         use_container_width=True,
         height=520,
         column_config=col_cfg,
@@ -356,7 +603,6 @@ elif page == "Frequency Analysis":
     game_id = game_selector()
     game_cfg = GAMES[game_id]
     df = load_draws(game_id)
-
     if df.empty:
         st.warning("No data loaded. Run the scraper first.")
     else:
@@ -445,7 +691,6 @@ elif page == "Statistical Tests":
     game_id = game_selector()
     game_cfg = GAMES[game_id]
     df = load_draws(game_id)
-
     if df.empty:
         st.warning("No data loaded. Run the scraper first.")
     else:
@@ -1099,7 +1344,7 @@ elif page == "Completeness":
     game_id = game_selector()
     game_cfg = GAMES[game_id]
 
-    conn = get_connection(read_only=True)
+    conn = get_connection()
     report = completeness_report(game_cfg, conn)
     conn.close()
 
@@ -1132,8 +1377,9 @@ elif page == "Completeness":
 
 elif page == "Probability & AI":
     from src.lotto.predict import (
-        number_heat_map, suggest_combinations, heat_map_summary, DISCLAIMER
+        number_heat_map, DISCLAIMER
     )
+    import src.lotto.lean_ml as _lean_ml
     from src.lotto.azure_ai import AzureAIClient
     import src.lotto.analysis as _an
 
@@ -1150,11 +1396,13 @@ elif page == "Probability & AI":
 
     game_id = game_selector()
     game_cfg = GAMES[game_id]
-    df = load_draws(game_id).sort_values("draw_date")
+    df = load_draws(game_id).sort_values(["draw_date", "draw_time"])
 
     if df.empty:
         st.warning("No data loaded. Use the Load Data panel in the sidebar first.")
         st.stop()
+
+    _prob_latest_date = str(df["draw_date"].max())[:10]
 
     is_multi_draw = len(game_cfg.draw_times) > 1
 
@@ -1166,6 +1414,16 @@ elif page == "Probability & AI":
     )
     window_map = {"All draws": None, "Last 90 draws": 90, "Last 30 draws": 30}
     window = window_map[window_choice]
+
+    # lean_ml exposes no version constant; hash its source to version both caches.
+    import hashlib as _hashlib
+    import inspect as _inspect
+    _LEAN_ML_VERSION = _hashlib.sha256(
+        _inspect.getsource(_lean_ml).encode()
+    ).hexdigest()[:16]
+    _data_hash = _hashlib.sha256(
+        pd.util.hash_pandas_object(df, index=False).values.tobytes()
+    ).hexdigest()[:16]
 
     # --- Number Heat Map ---
     st.subheader("Number Heat Map")
@@ -1309,7 +1567,10 @@ elif page == "Probability & AI":
             st.caption("Position-specific frequency analysis — each chart shows how often each digit appeared in that position across all draws.")
             if is_multi_draw:
                 pos_by_time = {
-                    dt: _pos_heat_map(df, game_cfg, draw_time=dt)
+                    dt: _pos_heat_map(
+                        df[df["draw_time"] == dt].tail(window) if window else df,
+                        game_cfg, draw_time=dt,
+                    )
                     for dt in game_cfg.draw_times
                 }
                 tab_labels = [_TIME_LABELS.get(dt, dt) for dt in game_cfg.draw_times]
@@ -1320,7 +1581,7 @@ elif page == "Probability & AI":
                 heat = pd.DataFrame()
                 heat_by_time = {dt: pd.DataFrame() for dt in game_cfg.draw_times}
             else:
-                pos_heat_single = _pos_heat_map(df, game_cfg)
+                pos_heat_single = _pos_heat_map(df.tail(window) if window else df, game_cfg)
                 _draw_position_charts(pos_heat_single)
                 heat = pd.DataFrame()
                 heat_by_time = {}
@@ -1346,55 +1607,113 @@ elif page == "Probability & AI":
                 with st.expander("Full heat map table"):
                     st.dataframe(heat, use_container_width=True)
 
-    # --- Combination Generator ---
-    st.subheader("Weighted Random Combinations")
+    # --- Local combinations: learned scoring or explicit uniform sampling ---
+    st.subheader("Combinations")
+    generation_mode = st.selectbox(
+        "Selection method", ["ML-assisted", "Uniform random"],
+        index=0, key="prob_generation_mode",
+    )
     st.caption(
-        "Numbers are sampled randomly using composite scores as weights. "
-        "Higher-scoring numbers are picked more often — but this is still random. "
-        "**Not a prediction.**"
+        "ML-assisted selection uses historical logistic-regression scores as sampling weights. "
+        "At least 100 valid draws per slot are required; 30/90-draw windows fall back to uniform random. "
+        "Scores are not ticket odds and do not establish a winning advantage. **Not a prediction.**"
+        if generation_mode == "ML-assisted" else
+        "Uniform random sampling — no learned weights. Every valid combination has the same "
+        "chance in a fair draw. **Not a prediction.**"
     )
 
     col_sl, col_lbl = st.columns([3, 5])
     with col_sl:
-        n_combos = st.slider("Number of combinations", 1, 10, 5, key="n_combos")
+        n_combos = st.slider("Number of combinations", 1, 50, 5, key="n_combos")
     with col_lbl:
         st.caption(
             f"Each combination picks **{game_cfg.picks} numbers** "
-            f"from 1–{game_cfg.pool} ({game_cfg.name})"
+            f"from {game_cfg.low_boundary}–{game_cfg.pool} ({game_cfg.name}). "
+            + ("Position order is preserved; repeated digits are allowed."
+               if game_cfg.ordered else "Numbers do not repeat within a combination.")
         )
 
     _combo_fmt = (
-        # ordered games: keep position order, show with dash separator
         (lambda combo: " – ".join(f"`{d:02d}`" for d in combo))
         if game_cfg.ordered else
         (lambda combo: " &nbsp;–&nbsp; ".join(f"`{n:02d}`" for n in combo))
     )
 
-    if is_multi_draw:
-        combo_tabs = st.tabs([_TIME_LABELS.get(dt, dt) for dt in game_cfg.draw_times])
-        for tab, dt in zip(combo_tabs, game_cfg.draw_times):
-            with tab:
-                combos = suggest_combinations(df, game_cfg, n=n_combos, window=window, draw_time=dt)
-                for i, combo in enumerate(combos, 1):
-                    st.markdown(f"**#{i}** &nbsp; " + _combo_fmt(combo))
-        st.caption(
-            "For ordered games, each position is sampled independently from its own frequency history. "
-            "Weighted sampling — not a prediction."
-            if game_cfg.ordered else
-            "Combinations are generated per draw time using that draw time's history only — weighted random sampling, not a prediction."
-        )
-    else:
-        combos = suggest_combinations(df, game_cfg, n=n_combos, window=window)
-        for i, combo in enumerate(combos, 1):
+    _ai_combo_key = (
+        f"ai_combo_lean_v1_{_LEAN_ML_VERSION}_{game_id}_{window}_{_data_hash}"
+        f"_{generation_mode}_{n_combos}"
+    )
+    # One source of truth for display and the optional AI explanation.
+    with st.spinner("Preparing combinations and chronological evaluation…"):
+        generation_by_label = {
+            _TIME_LABELS.get(dt, dt): _prob_generation(
+                df, _data_hash, game_id, window, dt, n_combos,
+                generation_mode, _LEAN_ML_VERSION,
+            )
+            for dt in game_cfg.draw_times
+        }
+
+    def _render_generation(result: dict) -> None:
+        for i, combo in enumerate(result["combinations"], 1):
             st.markdown(f"**#{i}** &nbsp; " + _combo_fmt(combo))
+        evaluation = result["evaluation"]
+        if result["method"] == "uniform_fallback":
+            st.warning(result["reason"])
+        metrics = st.columns(3)
+        for column, label, value in zip(
+            metrics,
+            ["Test model Brier", "Uniform Brier", "Test draws"],
+            [evaluation.get("model_brier"), evaluation.get("baseline_brier"),
+             evaluation.get("test_draws", 0)],
+        ):
+            column.metric(label, "N/A" if value is None else
+                          (str(value) if label == "Test draws" else f"{value:.6f}"))
+        interval = evaluation.get("improvement_ci95", [])
         st.caption(
-            "For ordered games, each position is sampled from its own frequency distribution — not a prediction."
-            if game_cfg.ordered else
-            "Generated by weighted random sampling — no special predictive value."
+            "Lower Brier loss is better. 95% CI for uniform minus model loss: "
+            + (f"[{interval[0]:.6f}, {interval[1]:.6f}]." if len(interval) == 2
+               else "not evaluated.")
+            + " Positive values favor the model; this is not evidence of improved lottery odds."
         )
+        if evaluation.get("evidence_of_improvement"):
+            st.info("Historical test Brier improvement observed; no demonstrated winning edge.")
+        else:
+            st.info("No demonstrated edge over uniform sampling.")
+        st.caption(
+            f"Evaluation status: {evaluation['status']} · "
+            f"Valid windowed draws: {evaluation.get('usable_draws', 0):,} · "
+            f"Production training draws: {result['training_draws']:,} "
+            f"(excludes the {_lean_ml.BURN_IN}-draw burn-in)."
+        )
+        with st.expander("Per-number model scores and feature weights"):
+            if result["scores"]:
+                st.dataframe(pd.DataFrame(result["scores"]), hide_index=True,
+                             use_container_width=True)
+                st.caption("Marginal scores used for sampling, not joint ticket probabilities.")
+                st.dataframe(pd.DataFrame([
+                    {"feature": name, "coefficient": weight}
+                    for name, weight in result["feature_weights"].items()
+                ]), hide_index=True, use_container_width=True)
+                st.caption("Standardized logistic coefficients are associations, not causal effects.")
+            else:
+                st.caption("No learned scores or coefficients for uniform sampling.")
+            if evaluation.get("caution"):
+                st.caption(evaluation["caution"])
+
+    if is_multi_draw:
+        combo_tabs = st.tabs(list(generation_by_label))
+        for tab, result in zip(combo_tabs, generation_by_label.values()):
+            with tab:
+                _render_generation(result)
+    else:
+        _render_generation(next(iter(generation_by_label.values())))
 
     # --- Azure AI Analysis ---
     st.subheader("AI Statistical Interpretation")
+    st.caption(
+        f"Analysis based on **{len(df):,} draws** up to **{_prob_latest_date}**. "
+        "Result persists this session — click Regenerate or Update Data for a fresh analysis."
+    )
 
     ai_client = AzureAIClient()
     if not ai_client.is_configured():
@@ -1406,106 +1725,385 @@ elif page == "Probability & AI":
             f"API version: `{ai_client._api_version}`"
         )
 
-        col_test, col_gen = st.columns([1, 2])
-        with col_test:
-            if st.button("Test connection", key="test_ai"):
-                with st.spinner("Pinging Azure OpenAI…"):
-                    try:
-                        reply = ai_client.test_connection()
-                        st.success(f"Connected — model replied: {reply!r}")
-                    except Exception as exc:
-                        st.error(f"Connection failed: {exc}")
+        def _build_slots_data():
+            """Use the generator's validated history and exact displayed tickets."""
+            slots = []
+            for dt in game_cfg.draw_times:
+                label = _TIME_LABELS.get(dt, dt)
+                clean = _lean_ml._prepare_draws(df, game_cfg, window, dt)
+                cols = [f"n{i}" for i in range(1, game_cfg.picks + 1)]
+                rows = []
+                groups = (
+                    [(pos, clean[col].value_counts()) for pos, col in enumerate(cols, 1)]
+                    if game_cfg.ordered else
+                    [(None, pd.Series(clean[cols].to_numpy().ravel()).value_counts())]
+                )
+                for position, counts in groups:
+                    for number in range(game_cfg.low_boundary, game_cfg.pool + 1):
+                        rows.append({
+                            "number": number, "total_draws": int(counts.get(number, 0)),
+                            **({"position": position} if position is not None else {}),
+                        })
+                slots.append({
+                    "label": label, "heat_map_rows": rows, "total_draws": len(clean),
+                    "generation": generation_by_label[label],
+                })
+            return slots
 
-        with col_gen:
-            if st.button("Generate AI Analysis", key="gen_ai"):
-                with st.spinner("Calling Azure OpenAI…"):
-                    try:
-                        if game_cfg.ordered:
-                            chi_result = _an.digit_uniformity(df, game_cfg).conclusion
-                            gap_result = _an.digit_repeat_rate(df, game_cfg).conclusion
-                        else:
-                            chi_result = _an.freq_chi_square(df, game_cfg).conclusion
-                            gap_result = _an.gap_analysis(df, game_cfg).conclusion
+        def _render_ai_results(ai_results: dict) -> None:
+            for slot_label, res in ai_results.items():
+                if is_multi_draw:
+                    st.markdown(f"#### {slot_label}")
+                if res.get("combination"):
+                    combo_str = " — ".join(f"**{n:02d}**" for n in res["combination"])
+                    heading = (
+                        "ML-assisted Combination — AI Explanation"
+                        if res.get("generation", {}).get("method") == "logistic_regression"
+                        else "Uniform random Combination — AI Explanation"
+                    )
+                    st.success(
+                        f"### {heading}\n\n"
+                        f"{combo_str}\n\n*{game_cfg.name}*"
+                        + (f" · {slot_label}" if is_multi_draw else "")
+                    )
+                    # Save as Bet — unique key per slot
+                    _save_key = f"save_ai_{game_cfg.id}_{slot_label}"
+                    _label_key = f"save_label_{game_cfg.id}_{slot_label}"
+                    _bet_date_key = f"save_betdate_{game_cfg.id}_{slot_label}"
+                    import datetime as _dt_mod2
 
-                        if game_cfg.ordered:
-                            # Build position-summary rows for the AI (one row per position per digit)
-                            def _pos_rows(pos_heat_dict):
-                                rows = []
-                                for pos, ph in pos_heat_dict.items():
-                                    for _, r in ph.iterrows():
-                                        rows.append({
-                                            "number": int(r["digit"]),
-                                            "position": pos,
-                                            "total_draws": int(r["count"]),
-                                            "heat_score": float(r["frequency_pct"]),
-                                            "gap_score": 0.0,
-                                            "composite_score": max(0.0, float(r["deviation_z"]) + 2) / 4,
-                                            "current_gap": 0,
-                                        })
-                                return rows
+                    # --- Auto-generate label and next draw date ---
+                    _WDAY = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3,
+                             "Fri": 4, "Sat": 5, "Sun": 6}
+                    _REVERSE_TL = {"2:00 PM": "14:00", "5:00 PM": "17:00", "9:00 PM": "21:00"}
+                    _draw_days_idx = {_WDAY[d] for d in game_cfg.draw_days}
+                    _today = _dt_mod2.date.today()
+                    _next_draw = next(
+                        (_today + _dt_mod2.timedelta(days=i)
+                         for i in range(1, 8)
+                         if (_today + _dt_mod2.timedelta(days=i)).weekday() in _draw_days_idx),
+                        _today + _dt_mod2.timedelta(days=1),
+                    )
+                    _game_slug = game_cfg.name.replace(" ", "").replace("/", "")
+                    if is_multi_draw:
+                        _dt_str = _REVERSE_TL.get(slot_label, slot_label).replace(":", "")
+                        _auto_label = f"{_next_draw.strftime('%Y%m%d')}_{_dt_str}_{_game_slug}"
+                    else:
+                        _auto_label = f"{_next_draw.strftime('%Y%m%d')}_{_game_slug}"
 
-                            if is_multi_draw:
-                                slots_data = [
-                                    {
-                                        "label": _TIME_LABELS.get(dt, dt),
-                                        "heat_map_rows": _pos_rows(pos_by_time[dt]),
-                                        "total_draws": int((df["draw_time"] == dt).sum()),
-                                    }
-                                    for dt in game_cfg.draw_times
-                                ]
-                            else:
-                                slots_data = [
-                                    {
-                                        "label": _TIME_LABELS.get(game_cfg.draw_times[0], "9:00 PM"),
-                                        "heat_map_rows": _pos_rows(pos_heat_single),
-                                        "total_draws": len(df),
-                                    }
-                                ]
-                        elif is_multi_draw:
-                            slots_data = [
-                                {
-                                    "label": _TIME_LABELS.get(dt, dt),
-                                    "heat_map_rows": heat_by_time[dt].to_dict(orient="records"),
-                                    "total_draws": int((df["draw_time"] == dt).sum()),
-                                }
-                                for dt in game_cfg.draw_times
-                            ]
-                        else:
-                            slots_data = [
-                                {
-                                    "label": _TIME_LABELS.get(game_cfg.draw_times[0], "9:00 PM"),
-                                    "heat_map_rows": heat.to_dict(orient="records"),
-                                    "total_draws": len(df),
-                                }
-                            ]
-
-                        ai_results = ai_client.interpret_lotto_stats(
-                            game_name=game_cfg.name,
-                            slots=slots_data,
-                            chi_sq_result=chi_result,
-                            gap_result=gap_result,
-                            picks=game_cfg.picks,
+                    _sc1, _sc2 = st.columns([2, 1])
+                    with _sc1:
+                        _label_val = st.text_input(
+                            "Note (optional)",
+                            key=_label_key,
+                            value=_auto_label,
+                            label_visibility="collapsed",
                         )
+                    with _sc2:
+                        _bet_date_val = st.date_input(
+                            "Draw date",
+                            key=_bet_date_key,
+                            value=_next_draw,
+                            min_value=_today,
+                            format="YYYY-MM-DD",
+                            label_visibility="collapsed",
+                        )
+                    if st.button("🎯 Save as Bet", key=_save_key):
+                        _combo_formatted = "-".join(f"{n:02d}" for n in res["combination"])
+                        _dt_save = slot_label if is_multi_draw else None
+                        try:
+                            _conn_sv = get_connection()
+                            _conn_sv.execute(
+                                """INSERT INTO saved_combinations
+                                   (id, saved_at, game, draw_time, combination, reasoning,
+                                    label, source, bet_date, status, ml_run_id)
+                                   VALUES (nextval('saved_combinations_seq'), NOW(),
+                                           ?, ?, ?, ?, ?, 'bet', ?, 'pending', ?)""",
+                                [game_cfg.id, _dt_save, _combo_formatted,
+                                 res.get("reasoning"), _label_val or None,
+                                 _bet_date_val, None],
+                            )
+                            _conn_sv.close()
+                            st.toast(f"Bet saved: {_combo_formatted}", icon="🎯")
+                        except Exception as _sv_exc:
+                            st.error(f"Save failed: {_sv_exc}")
+                if res.get("reasoning"):
+                    st.info(res["reasoning"])
+                if res.get("disclaimer"):
+                    st.caption(f"⚠️ {res['disclaimer']}")
 
-                        for slot_label, res in ai_results.items():
-                            if is_multi_draw:
-                                st.markdown(f"#### {slot_label}")
-                            if res["combination"]:
-                                combo_str = " — ".join(
-                                    f"**{n:02d}**" for n in res["combination"]
-                                )
-                                st.success(
-                                    f"### Most Statistically Supported Combination\n\n"
-                                    f"{combo_str}\n\n"
-                                    f"*{game_cfg.name}*"
-                                    + (f" · {slot_label}" if is_multi_draw else "")
-                                )
-                            if res["reasoning"]:
-                                st.info(res["reasoning"])
-                            if res["disclaimer"]:
-                                st.caption(f"⚠️ {res['disclaimer']}")
-                    except Exception as exc:
-                        st.error(f"Azure AI error: {exc}")
+                if not res.get("combination") and not res.get("reasoning"):
+                    st.warning("AI returned an empty response. Click Regenerate to try again.")
+
+        generate_requested = st.button("Generate / Regenerate AI Explanation", key="regen_ai")
+        if generate_requested:
+            st.session_state.pop(_ai_combo_key, None)
+            st.session_state.pop(f"{_ai_combo_key}_prompt", None)
+
+        if _ai_combo_key in st.session_state:
+            st.caption(f"Based on **{len(df):,} draws** up to **{_prob_latest_date}**.")
+            _render_ai_results(st.session_state[_ai_combo_key])
+        elif generate_requested:
+            with st.spinner("AI is analysing latest draws — this may take a moment…"):
+                try:
+                    if game_cfg.ordered:
+                        chi_result = _an.digit_uniformity(df, game_cfg).conclusion
+                        gap_result = _an.digit_repeat_rate(df, game_cfg).conclusion
+                    else:
+                        chi_result = _an.freq_chi_square(df, game_cfg).conclusion
+                        gap_result = _an.gap_analysis(df, game_cfg).conclusion
+
+                    _slots = [slot for slot in _build_slots_data() if slot["heat_map_rows"]]
+                    ai_results = ai_client.interpret_lotto_stats(
+                        game_name=game_cfg.name,
+                        slots=_slots,
+                        chi_sq_result=chi_result,
+                        gap_result=gap_result,
+                        picks=game_cfg.picks,
+                    )
+                    st.session_state[_ai_combo_key] = ai_results
+                    st.session_state[f"{_ai_combo_key}_prompt"] = ai_client.last_prompt
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Azure AI error: {exc}")
+
+    # ---- Same-Date Historical Comparison — All Games ----
+    import datetime as _dt_cmp
+    _cmp_today = _dt_cmp.date.today()
+    _cmp_month_name = _cmp_today.strftime("%B")
+    _cmp_day_num = _cmp_today.day
+
+    st.markdown("---")
+    st.subheader(f"📅 On This Day — {_cmp_month_name} {_cmp_day_num}, All Years & {game_cfg.name}")
+    st.caption(
+        "Actual winning numbers drawn on this calendar date in every year since this game started. "
+        + ("Numbers in the current AI combination are highlighted **orange**."
+           if _ai_combo_key in st.session_state else "Run AI analysis above to highlight matching numbers.")
+    )
+
+    # Collect AI combination numbers from all draw-time slots (empty set if AI not run yet)
+    _cmp_ai_nums: set[int] = set()
+    for _cslot in st.session_state.get(_ai_combo_key, {}).values():
+        _cmp_ai_nums.update(int(n) for n in _cslot.get("combination", []))
+
+    # Build table for the selected game only
+    _cmp_all_rows: list[dict] = []
+    for _cgid, _cgcfg in [(game_cfg.id, game_cfg)]:
+        try:
+            _cgdf = load_draws(_cgid)
+        except Exception:
+            continue
+        if _cgdf.empty:
+            continue
+        _cgdd = pd.to_datetime(_cgdf["draw_date"])
+        _cg_same = _cgdf[
+            (_cgdd.dt.month == _cmp_today.month) & (_cgdd.dt.day == _cmp_today.day)
+        ].sort_values("draw_date")
+        if _cg_same.empty:
+            continue
+
+        _cg_num_cols = (
+            [f"pub_{i}" for i in range(1, _cgcfg.picks + 1)] if _cgcfg.ordered
+            else [f"n{i}" for i in range(1, _cgcfg.picks + 1)]
+        )
+        _cg_num_cols = [c for c in _cg_num_cols if c in _cg_same.columns]
+
+        for _, _crow in _cg_same.iterrows():
+            _cnums = [int(_crow[c]) for c in _cg_num_cols if pd.notna(_crow[c])]
+            _cmatches = len(set(_cnums) & _cmp_ai_nums) if _cmp_ai_nums else None
+            _cmp_all_rows.append({
+                "Game":      _cgcfg.name,
+                "Year":      int(str(_crow["draw_date"])[:4]),
+                "Draw Date": str(_crow["draw_date"])[:10],
+                "Numbers":   "  ".join(f"{n:02d}" for n in _cnums),
+                "Matches":   _cmatches,
+            })
+
+    if not _cmp_all_rows:
+        st.info(
+            f"No draws recorded on {_cmp_month_name} {_cmp_day_num} for any game yet. "
+            "Try loading more historical data using the sidebar."
+        )
+    else:
+        _cmp_tbl = pd.DataFrame(_cmp_all_rows)
+
+        # Summary metrics
+        _mc1, _mc2, _mc3 = st.columns(3)
+        _mc1.metric("Total draws on this date", len(_cmp_tbl))
+        _mc2.metric("Years with data", _cmp_tbl["Year"].nunique())
+        if _cmp_ai_nums and _cmp_tbl["Matches"].notna().any():
+            _mc3.metric(
+                "Best match (this game)",
+                f"{int(_cmp_tbl['Matches'].max(skipna=True))} / {game_cfg.picks}"
+            )
+
+        # Row styler
+        def _cmp_style(row):
+            m = row.get("Matches")
+            if m is not None and not (isinstance(m, float) and pd.isna(m)) and int(m) >= 3:
+                return ["background-color:#dcfce7; color:#14532d"] * len(row)
+            if m is not None and not (isinstance(m, float) and pd.isna(m)) and int(m) >= 1:
+                return ["background-color:#fef3c7; color:#92400e"] * len(row)
+            return [""] * len(row)
+
+        _display_tbl = _cmp_tbl.copy()
+        if not _cmp_ai_nums:
+            _display_tbl = _display_tbl.drop(columns=["Matches"])
+
+        _cmp_col_cfg: dict = {
+            "Game":      st.column_config.TextColumn("Game",      width="medium"),
+            "Year":      st.column_config.NumberColumn("Year",    format="%d", width="small"),
+            "Draw Date": st.column_config.TextColumn("Draw Date", width="medium"),
+            "Numbers":   st.column_config.TextColumn("Numbers",   width="large"),
+        }
+        if _cmp_ai_nums:
+            _cmp_col_cfg["Matches"] = st.column_config.NumberColumn("Matches", format="%d", width="small")
+
+        st.dataframe(
+            _display_tbl.style.apply(_cmp_style, axis=1),
+            use_container_width=True,
+            height=min(520, 38 + 35 * len(_display_tbl)),
+            column_config=_cmp_col_cfg,
+            hide_index=True,
+        )
+
+        # Frequency chart for selected game
+        with st.expander(f"Number frequency breakdown — {game_cfg.name}"):
+            for _fgame_name in _cmp_tbl["Game"].unique():
+                _frows = _cmp_tbl[_cmp_tbl["Game"] == _fgame_name]
+                _fnums_flat: list[int] = []
+                for _nr in _frows["Numbers"]:
+                    _fnums_flat.extend(int(x) for x in str(_nr).split() if x.isdigit())
+                if not _fnums_flat:
+                    continue
+                _ffreq = (
+                    pd.Series(_fnums_flat)
+                    .value_counts()
+                    .sort_index()
+                    .reset_index()
+                )
+                _ffreq.columns = ["number", "count"]
+                _ffreq["type"] = _ffreq["number"].apply(
+                    lambda n: "AI Pick" if n in _cmp_ai_nums else "Historical"
+                )
+                _ffig = px.bar(
+                    _ffreq, x="number", y="count", color="type",
+                    color_discrete_map={"AI Pick": "#f97316", "Historical": "#3b82f6"},
+                    title=f"{_fgame_name} — {_cmp_month_name} {_cmp_day_num} (all years)",
+                    labels={"number": "Number", "count": "Times drawn", "type": ""},
+                    height=260,
+                )
+                _ffig.update_layout(
+                    legend=dict(orientation="h", y=1.15),
+                    margin=dict(t=50, b=20),
+                )
+                st.plotly_chart(_ffig, use_container_width=True)
+
+    # ---- AI Combination vs All Historical Draws ----
+    if _cmp_ai_nums:
+        st.markdown("---")
+        st.subheader(f"🔍 AI Combination vs All Historical Draws — {game_cfg.name}")
+        st.caption(
+            "How often the current AI-suggested numbers would have matched past draws "
+            "across the entire recorded history of this game."
+        )
+
+        _hist_df = load_draws(game_cfg.id)
+        if not _hist_df.empty:
+            _h_num_cols = (
+                [f"pub_{i}" for i in range(1, game_cfg.picks + 1)] if game_cfg.ordered
+                else [f"n{i}" for i in range(1, game_cfg.picks + 1)]
+            )
+            _h_num_cols = [c for c in _h_num_cols if c in _hist_df.columns]
+
+            _hist_rows: list[dict] = []
+            for _, _hr in _hist_df.iterrows():
+                _hnums = [int(_hr[c]) for c in _h_num_cols if pd.notna(_hr[c])]
+                if not _hnums:
+                    continue
+                _hmatch = len(set(_hnums) & _cmp_ai_nums)
+                _hist_rows.append({
+                    "draw_date": str(_hr["draw_date"])[:10],
+                    "Numbers":   "  ".join(f"{n:02d}" for n in _hnums),
+                    "Matches":   _hmatch,
+                })
+
+            _hist_match_df = pd.DataFrame(_hist_rows)
+            _total_draws = len(_hist_match_df)
+
+            # Summary metrics per match count
+            _match_summary = (
+                _hist_match_df["Matches"]
+                .value_counts()
+                .sort_index(ascending=False)
+                .reset_index()
+            )
+            _match_summary.columns = ["Matches", "Count"]
+            _match_summary["% of Draws"] = (_match_summary["Count"] / _total_draws * 100).round(2)
+
+            _hc1, _hc2, _hc3, _hc4 = st.columns(4)
+            for _col, _min_match, _label in [
+                (_hc1, game_cfg.picks, "Jackpot match"),
+                (_hc2, game_cfg.picks - 1, f"{game_cfg.picks-1}-number match"),
+                (_hc3, game_cfg.picks - 2, f"{game_cfg.picks-2}-number match"),
+                (_hc4, 3, "3-number match"),
+            ]:
+                _cnt = int(_hist_match_df[_hist_match_df["Matches"] == _min_match]["Matches"].count())
+                _col.metric(_label, _cnt, f"{_cnt/_total_draws*100:.2f}% of {_total_draws:,} draws")
+
+            with st.expander("Top matching draws (3 or more matches)"):
+                _top_matches = (
+                    _hist_match_df[_hist_match_df["Matches"] >= 3]
+                    .sort_values(["Matches", "draw_date"], ascending=[False, False])
+                    .reset_index(drop=True)
+                )
+                if _top_matches.empty:
+                    st.info("No draws with 3 or more matches found in the full history.")
+                else:
+                    def _hist_style(row):
+                        m = int(row["Matches"])
+                        if m == game_cfg.picks:
+                            return ["background-color:#dcfce7; color:#14532d"] * len(row)
+                        if m >= game_cfg.picks - 1:
+                            return ["background-color:#dbeafe; color:#1e3a8a"] * len(row)
+                        if m >= 3:
+                            return ["background-color:#fef3c7; color:#92400e"] * len(row)
+                        return [""] * len(row)
+                    st.dataframe(
+                        _top_matches.style.apply(_hist_style, axis=1),
+                        use_container_width=True,
+                        height=min(520, 38 + 35 * len(_top_matches)),
+                        column_config={
+                            "draw_date": st.column_config.TextColumn("Draw Date", width="medium"),
+                            "Numbers":   st.column_config.TextColumn("Numbers",   width="large"),
+                            "Matches":   st.column_config.NumberColumn("Matches", format="%d", width="small"),
+                        },
+                        hide_index=True,
+                    )
+
+            with st.expander("Match count distribution"):
+                _mfig = px.bar(
+                    _match_summary,
+                    x="Matches", y="Count",
+                    text="% of Draws",
+                    labels={"Matches": "Numbers matched", "Count": "Draw count"},
+                    title=f"AI combination match frequency — {game_cfg.name} ({_total_draws:,} draws)",
+                    height=300,
+                )
+                _mfig.update_traces(texttemplate="%{text:.2f}%", textposition="outside")
+                _mfig.update_layout(margin=dict(t=50, b=20))
+                st.plotly_chart(_mfig, use_container_width=True)
+
+    # --- Full AI Prompt (copy & paste into other AI models) ---
+    _saved_prompt = st.session_state.get(f"{_ai_combo_key}_prompt", "")
+    if _saved_prompt:
+        st.markdown("---")
+        with st.expander("📋 Full prompt sent to AI — copy to run in Claude / Gemini / other models"):
+            st.caption(
+                "This is the exact prompt sent to the Azure OpenAI model. "
+                "Paste it into Claude, Gemini, GPT-4, or any other AI to compare results."
+            )
+            st.code(_saved_prompt, language="text")
 
 
 # ===========================================================================
@@ -1707,8 +2305,9 @@ elif page == "Combo Tools":
     _ct_gcfg = GAMES[_ct_game]
     _ct_df = load_draws(_ct_game)
 
-    _ct_tab1, _ct_tab2, _ct_tab3 = st.tabs(
-        ["Your Numbers Analyzer", "Wheeling System", "Syndicate Optimizer"]
+    _ct_tab1, _ct_tab2, _ct_tab3, _ct_tab4 = st.tabs(
+        ["Your Numbers Analyzer", "Wheeling System", "Syndicate Optimizer",
+         "🔎 Combination History"]
     )
 
     with _ct_tab1:
@@ -1790,6 +2389,58 @@ elif page == "Combo Tools":
             )
             st.dataframe(_syn_tdf, use_container_width=True)
 
+    with _ct_tab4:
+        from src.lotto.predict import find_combination_history
+        st.subheader("🔎 Combination History")
+        st.caption(
+            "Check whether a combination has ever been drawn before. "
+            "Enter your numbers below and see every past draw where this exact combination won."
+        )
+
+        _ch_pool = list(range(_ct_gcfg.low_boundary, _ct_gcfg.pool + 1))
+        _ch_nums = st.multiselect(
+            f"Select exactly {_ct_gcfg.picks} numbers to look up",
+            _ch_pool,
+            max_selections=_ct_gcfg.picks,
+            key="combo_history_nums",
+        )
+
+        if len(_ch_nums) == _ct_gcfg.picks:
+            _ch_res = find_combination_history(_ch_nums, _ct_gcfg, _ct_df)
+            _combo_str = " - ".join(str(n) for n in _ch_res["combo"])
+
+            if _ch_res["found"]:
+                st.error(
+                    f"⚠️ **{_combo_str}** has been drawn **{_ch_res['times_drawn']} time(s)** before!",
+                    icon="🚨",
+                )
+                c1, c2 = st.columns(2)
+                c1.metric("First drawn", _ch_res["first_drawn"])
+                c2.metric("Most recently", _ch_res["last_drawn"])
+
+                st.markdown("#### All matching draws")
+                _ch_df = _ch_res["draws"].copy()
+                # Rename for display
+                _ch_df.columns = [c.replace("_", " ").title() for c in _ch_df.columns]
+                st.dataframe(_ch_df, use_container_width=True, hide_index=True)
+
+                st.info(
+                    "This combination has appeared before, but that does **not** make it "
+                    "more or less likely in future draws. Each draw is an independent "
+                    "random event with no memory of past results."
+                )
+            else:
+                st.success(
+                    f"✅ **{_combo_str}** has **never been drawn** in this game's recorded history.",
+                    icon="🎯",
+                )
+                st.info(
+                    "This combination has no prior win on record, but that does **not** make "
+                    "it more likely to be drawn. All combinations have equal probability."
+                )
+        elif _ch_nums:
+            st.warning(f"Select {_ct_gcfg.picks - len(_ch_nums)} more number(s) to search.")
+
 
 # ===========================================================================
 # Page 9: Gambler's Edge
@@ -1805,8 +2456,9 @@ elif page == "Gambler's Edge":
         "this is expected for any lottery. The goal is to understand the math."
     )
 
-    _ge_tab1, _ge_tab2, _ge_tab3 = st.tabs(
-        ["EV Calculator", "Jackpot Rollover", "Never-Drawn Patterns"]
+    _ge_tab1, _ge_tab2, _ge_tab3, _ge_tab4, _ge_tab5 = st.tabs(
+        ["EV Calculator", "Jackpot Rollover", "Never-Drawn Patterns",
+            "Bias Detector", "Manual Wheel"]
     )
 
     with _ge_tab1:
@@ -1814,9 +2466,23 @@ elif page == "Gambler's Edge":
         _ev_game = game_selector("Game")
         _ev_gcfg = GAMES[_ev_game]
         _ev_min = MIN_JACKPOTS.get(_ev_game, 0)
-        _ev_jp = st.number_input("Current jackpot (₱)", min_value=0.0,
-                                   value=float(_ev_min), step=1_000_000.0,
-                                   format="%.0f")
+        # Auto-load latest jackpot from DB; fall back to minimum if not available
+        try:
+            _live_jps = jackpots_from_db(get_connection())
+            _ev_live = _live_jps.get(_ev_game)
+        except Exception:
+            _ev_live = None
+        _ev_default = float(_ev_live if _ev_live else _ev_min)
+        _ev_jp = st.number_input(
+            "Current jackpot (₱)",
+            min_value=0.0,
+            value=_ev_default,
+            step=1_000_000.0,
+            format="%.0f",
+            help="Auto-loaded from latest draw in DB. Edit to adjust.",
+        )
+        if _ev_live:
+            st.caption(f"📡 Live jackpot from DB: ₱{_ev_live:,.0f}")
 
         _ev_res = expected_value(_ev_gcfg, jackpot_php=_ev_jp)
         c1, c2, c3 = st.columns(3)
@@ -1884,6 +2550,133 @@ elif page == "Gambler's Edge":
         if not _nd_res.table.empty:
             st.dataframe(_nd_res.table.head(200), use_container_width=True)
 
+    # ---- Tab 4: Sequential Bias Detector ----
+    with _ge_tab4:
+        from src.lotto.analysis import sequential_bias_test as _seq_bias
+        st.subheader("📈 Sequential Bias Detector")
+        st.caption(
+            "Tracks each number's cumulative frequency vs statistically expected over every draw. "
+            "A fair draw keeps all Z-scores within **±2σ** ~95% of the time. "
+            "Sustained deviation is a mechanical bias signal — the longer it persists, the less likely it is noise. "
+            "**This is a fairness audit, not a prediction tool.**"
+        )
+        _sb_game = game_selector("Game (bias)")
+        _sb_gcfg = GAMES[_sb_game]
+        _sb_df = load_draws(_sb_game)
+        with st.spinner("Running sequential bias test…"):
+            _sb_res = _seq_bias(_sb_df, _sb_gcfg)
+
+        _sb_meta = _sb_res.meta
+        _sb_c1, _sb_c2, _sb_c3 = st.columns(3)
+        _sb_c1.metric("Draws analysed", f"{_sb_meta['n_draws']:,}")
+        _sb_c2.metric("Hot numbers (Z>2)", len(_sb_meta["hot_numbers"]))
+        _sb_c3.metric("Cold numbers (Z<-2)", len(_sb_meta["cold_numbers"]))
+        st.info(_sb_res.conclusion)
+
+        # Z-score bar chart
+        import plotly.express as _px_ge
+        _sb_fig = _px_ge.bar(
+            _sb_res.table,
+            x="number", y="z_score",
+            color="bias",
+            color_discrete_map={"HOT 🔴": "#ef4444", "COLD 🔵": "#3b82f6", "normal ✅": "#6b7280"},
+            title=f"Z-score per number — {_sb_gcfg.name} ({_sb_meta['n_draws']:,} draws)",
+            labels={"number": "Number", "z_score": "Z-score"},
+        )
+        _sb_fig.add_hline(y=2, line_dash="dash", line_color="#ef4444", annotation_text="+2σ")
+        _sb_fig.add_hline(y=-2, line_dash="dash", line_color="#3b82f6", annotation_text="-2σ")
+        _sb_fig.update_layout(height=400)
+        st.plotly_chart(_sb_fig, use_container_width=True)
+
+        # Top biased numbers
+        _sb_top = _sb_res.table[_sb_res.table["significance"] != "ns"]
+        if not _sb_top.empty:
+            st.markdown("**Statistically significant deviations (p<0.05)**")
+            st.dataframe(_sb_top[["number", "appearances", "expected", "z_score", "bias", "significance"]],
+                         hide_index=True, use_container_width=True)
+        else:
+            st.success("No numbers show statistically significant deviation from expected frequency.")
+
+        with st.expander("Full table (all numbers)"):
+            st.dataframe(_sb_res.table, hide_index=True, use_container_width=True)
+
+    # ---- Tab 5: Manual Wheel ----
+    with _ge_tab5:
+        from src.lotto.wheel import full_wheel, abbreviated_wheel, wheel_stats as _wstats
+        from src.lotto.ev import TICKET_PRICES
+        from math import comb as _mcomb
+
+        st.subheader("⚙️ Manual Wheel")
+        st.caption(
+            "Choose your own key numbers for a full or abbreviated wheel. Coverage is "
+            "conditional on winning numbers falling within your key set: a full wheel "
+            "contains the jackpot combination only if all six winning numbers are in the set; "
+            "an abbreviated wheel guarantees at least a 4-number match only if at least "
+            "four winning numbers are in the set. More tickets cost more. "
+            "Wheeling offers no predictive advantage and does not improve any individual ticket's odds."
+        )
+        _mw_game = st.selectbox(
+            "Game (wheel)",
+            [gid for gid, cfg in GAMES.items() if not cfg.ordered and cfg.picks == 6],
+            format_func=lambda gid: GAMES[gid].name,
+            key="mw_game",
+        )
+        _mw_gcfg = GAMES[_mw_game]
+
+        _mw_c1, _mw_c2 = st.columns(2)
+        with _mw_c1:
+            _mw_keys = st.multiselect(
+                "Select key numbers (6–15)",
+                list(range(_mw_gcfg.low_boundary, _mw_gcfg.pool + 1)),
+                max_selections=15,
+                key=f"mw_keys_{_mw_game}",
+                help="Limited to 15 keys to keep wheel generation manageable.",
+            )
+        with _mw_c2:
+            _mw_mode = st.radio("Wheel type", ["Full wheel", "Abbreviated (4-match guarantee)"], key="mw_mode")
+
+        _mw_n_keys = len(_mw_keys)
+        _mw_full_n = _mcomb(_mw_n_keys, _mw_gcfg.picks)
+        _mw_over_limit = _mw_mode == "Full wheel" and _mw_full_n > 5000
+        if _mw_n_keys < _mw_gcfg.picks:
+            st.info(f"Select at least {_mw_gcfg.picks} key numbers to generate a wheel.")
+        else:
+            _mw_price = TICKET_PRICES.get(_mw_game, 20)
+            st.caption(
+                f"Full wheel = **{_mw_full_n:,} tickets** × ₱{_mw_price} = "
+                f"**₱{_mw_full_n * _mw_price:,.0f}**. "
+                "Abbreviated mode uses a reduced ticket set; its exact count and cost "
+                "are shown after generation."
+            )
+        if _mw_over_limit:
+            st.warning(
+                f"Full wheel has {_mw_full_n:,} tickets — exceeds the 5,000-ticket limit. "
+                "Reduce key numbers or use Abbreviated mode."
+            )
+
+        if st.button(
+            "Generate Wheel Tickets", key="mw_generate",
+            disabled=_mw_n_keys < _mw_gcfg.picks or _mw_over_limit,
+        ):
+            with st.spinner("Generating wheel…"):
+                if _mw_mode == "Full wheel":
+                    _mw_tickets = full_wheel(_mw_keys, _mw_gcfg)
+                else:
+                    _mw_tickets = abbreviated_wheel(_mw_keys, _mw_gcfg, guarantee=4)
+                _mw_stats = _wstats(_mw_tickets, _mw_gcfg)
+
+            _ws_c1, _ws_c2, _ws_c3 = st.columns(3)
+            _ws_c1.metric("Tickets", f"{_mw_stats['n_tickets']:,}")
+            _ws_c2.metric("Cost", f"₱{_mw_stats['cost_php']:,.0f}")
+            _ws_c3.metric("Pool coverage", f"{_mw_stats['pool_coverage_pct']}%")
+            st.caption("Pool coverage is the share of distinct numbers covered, not the chance of winning.")
+
+            _ws_tdf = pd.DataFrame(
+                [" – ".join(f"{n:02d}" for n in t) for t in _mw_tickets],
+                columns=["combination"]
+            )
+            st.dataframe(_ws_tdf, use_container_width=True, hide_index=True)
+
 
 # ===========================================================================
 # Page 10: Data Quality
@@ -1935,3 +2728,302 @@ elif page == "Data Quality":
             )
         except ImportError:
             st.info("Install openpyxl for Excel export: `pip install openpyxl`")
+
+# ===========================================================================
+elif page == "Saved Combos":
+    import datetime as _dt_sv
+
+    st.title("🎯 My Bets")
+    st.caption(
+        "AI-generated combinations you saved as bets from the **Probability & AI** page. "
+        "Track status, check results against actual draws, and manage your bet history."
+    )
+
+    # Auto-refresh on every page load — silently match pending bets against actual draws
+    try:
+        _auto_updated = compare_with_actual()
+        if _auto_updated:
+            st.toast(f"Auto-updated {_auto_updated} bet(s) with actual draw results.", icon="✅")
+    except Exception:
+        pass
+
+    _rf_col, _ = st.columns([1, 4])
+    with _rf_col:
+        if st.button("🔄 Refresh Results", key="refresh_actuals",
+                     help="Manually re-compare all pending bets whose draw date has passed"):
+            try:
+                _n_updated = compare_with_actual()
+                if _n_updated:
+                    st.success(f"Updated {_n_updated} bet(s) with actual draw results.")
+                else:
+                    st.info("No new results found. Draws may not yet be loaded for those dates.")
+            except Exception as _rf_exc:
+                st.error(f"Refresh failed: {_rf_exc}")
+            st.rerun()
+
+    _STATUS_EMOJI = {"pending": "⏳", "won": "🏆", "lost": "❌", "cancelled": "🚫"}
+    _STATUS_OPTIONS = ["pending", "won", "lost", "cancelled"]
+
+    def _load_bets(game_filter: str | None = None, status_filter: str | None = None) -> pd.DataFrame:
+        _conn_r = get_connection()
+        try:
+            _df = _conn_r.execute("""
+                SELECT id, saved_at, game, draw_time, combination,
+                       label,
+                       COALESCE(source, 'bet') AS source,
+                       bet_date,
+                       COALESCE(status, 'pending') AS status,
+                       LEFT(reasoning, 400) AS reasoning_preview,
+                       actual_draw,
+                       match_count,
+                       number_distances,
+                       ml_run_id
+                FROM saved_combinations
+                ORDER BY
+                    CASE COALESCE(status,'pending') WHEN 'pending' THEN 0 ELSE 1 END,
+                    bet_date ASC NULLS LAST,
+                    saved_at DESC
+            """).fetchdf()
+        finally:
+            _conn_r.close()
+        if _df.empty:
+            return _df
+        if game_filter and game_filter != "All":
+            _df = _df[_df["game"] == game_filter]
+        if status_filter and status_filter != "All":
+            _df = _df[_df["status"] == status_filter]
+        return _df
+
+    # Ensure table + columns exist for DBs created before bet_date/status were added
+    _sv_init_conn = get_connection()
+    try:
+        for _col, _ctype in [("bet_date", "DATE"), ("status", "VARCHAR(16)"),
+                              ("source", "VARCHAR(16)")]:
+            try:
+                _sv_init_conn.execute(
+                    f"ALTER TABLE saved_combinations ADD COLUMN {_col} {_ctype}"
+                )
+            except Exception:
+                pass
+    finally:
+        _sv_init_conn.close()
+
+    _bets_all = _load_bets()
+
+    if _bets_all.empty:
+        st.info(
+            "No bets saved yet.  \n"
+            "Go to **Probability & AI**, run an AI analysis, "
+            "then click **🎯 Save as Bet**."
+        )
+    else:
+        # Summary metrics
+        _n_pending = int((_bets_all["status"] == "pending").sum())
+        _n_won = int((_bets_all["status"] == "won").sum())
+        _n_lost = int((_bets_all["status"] == "lost").sum())
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _mc1.metric("Total Bets", len(_bets_all))
+        _mc2.metric("⏳ Pending", _n_pending)
+        _mc3.metric("🏆 Won", _n_won)
+        _mc4.metric("❌ Lost", _n_lost)
+
+        st.markdown("---")
+
+        # Filters
+        _fc1, _fc2 = st.columns(2)
+        with _fc1:
+            _sv_games = ["All"] + sorted(_bets_all["game"].unique().tolist())
+            _sv_game_filter = st.selectbox(
+                "Game", _sv_games,
+                format_func=lambda k: GAMES[k].name if k != "All" else "All games",
+                key="sv_game_filter",
+            )
+        with _fc2:
+            _sv_status_filter = st.selectbox(
+                "Status", ["All"] + _STATUS_OPTIONS,
+                format_func=lambda s: f"{_STATUS_EMOJI.get(s, '')} {s.capitalize()}" if s != "All" else "All statuses",
+                key="sv_status_filter",
+            )
+
+        _bets = _load_bets(_sv_game_filter, _sv_status_filter)
+
+        if _bets.empty:
+            st.info("No bets match the selected filters.")
+        else:
+            for _, _row in _bets.iterrows():
+                _gcfg = GAMES.get(str(_row["game"]))
+                _gname = _gcfg.name if _gcfg else _row["game"]
+                _nums = [int(n) for n in str(_row["combination"]).split("-") if n.strip().isdigit()]
+                _dt_str = f" · {_row['draw_time']}" if pd.notna(_row["draw_time"]) and _row["draw_time"] else ""
+                _lbl = f" — {_row['label']}" if pd.notna(_row["label"]) and _row["label"] else ""
+                _bet_d = str(_row["bet_date"])[:10] if pd.notna(_row.get("bet_date")) and _row.get("bet_date") else "—"
+                _status = str(_row.get("status") or "pending")
+                _sem = _STATUS_EMOJI.get(_status, "⏳")
+                _saved_str = str(_row["saved_at"])[:16]
+
+                _exp_title = (
+                    f"{_sem} {_gname}{_dt_str}{_lbl}  |  {_row['combination']}  "
+                    f"|  Draw: {_bet_d}  |  Saved: {_saved_str}"
+                )
+
+                with st.expander(_exp_title, expanded=(_status == "pending")):
+                    # Combination display
+                    _combo_md = "  ·  ".join(f"**{n:02d}**" for n in _nums)
+                    st.markdown(f"## {_combo_md}")
+                    st.caption(
+                        f"Game: **{_gname}**{_dt_str}  |  "
+                        f"Bet draw: **{_bet_d}**  |  "
+                        f"Saved: {_saved_str}"
+                    )
+
+                    # Status + result update row
+                    _ua, _ub = st.columns([2, 2])
+                    with _ua:
+                        _new_status = st.selectbox(
+                            "Status",
+                            _STATUS_OPTIONS,
+                            index=_STATUS_OPTIONS.index(_status) if _status in _STATUS_OPTIONS else 0,
+                            format_func=lambda s: f"{_STATUS_EMOJI[s]} {s.capitalize()}",
+                            key=f"status_sel_{_row['id']}",
+                        )
+                    with _ub:
+                        _new_label = st.text_input(
+                            "Note",
+                            value=str(_row["label"] or ""),
+                            key=f"lbl_{_row['id']}",
+                            placeholder="Add a note…",
+                        )
+
+                    _bd_col, _save_col = st.columns([2, 1])
+                    with _bd_col:
+                        _cur_bet_date = None
+                        if pd.notna(_row.get("bet_date")) and _row.get("bet_date"):
+                            try:
+                                _cur_bet_date = pd.to_datetime(_row["bet_date"]).date()
+                            except Exception:
+                                pass
+                        _new_bet_date = st.date_input(
+                            "Draw date",
+                            value=_cur_bet_date,
+                            key=f"bd_{_row['id']}",
+                            format="YYYY-MM-DD",
+                        )
+                    with _save_col:
+                        st.write("")
+                        st.write("")
+                        if st.button("Save changes", key=f"upd_{_row['id']}"):
+                            _uc = get_connection()
+                            try:
+                                _uc.execute(
+                                    """UPDATE saved_combinations
+                                       SET status = ?, label = ?, bet_date = ?
+                                       WHERE id = ?""",
+                                    [_new_status, _new_label or None,
+                                     _new_bet_date, int(_row["id"])],
+                                )
+                            finally:
+                                _uc.close()
+                            st.rerun()
+
+                    # Check vs actual draw on the bet date (or latest draw if no bet date)
+                    if _gcfg and _nums:
+                        _check_date = None
+                        if pd.notna(_row.get("bet_date")) and _row.get("bet_date"):
+                            try:
+                                _check_date = pd.to_datetime(_row["bet_date"]).date()
+                            except Exception:
+                                pass
+
+                        if _check_date:
+                            _actual = _query(
+                                "SELECT draw_date, " + ", ".join(f"n{i}" for i in range(1, _gcfg.picks + 1)) +
+                                " FROM draws WHERE game = ? AND draw_date = ? LIMIT 1",
+                                [_gcfg.id, _check_date.isoformat()],
+                            )
+                            _check_label = f"Draw on {_check_date}"
+                        else:
+                            _actual = _query(
+                                "SELECT draw_date, " + ", ".join(f"n{i}" for i in range(1, _gcfg.picks + 1)) +
+                                " FROM draws WHERE game = ? ORDER BY draw_date DESC LIMIT 1",
+                                [_gcfg.id],
+                            )
+                            _check_label = "Latest draw"
+
+                        if not _actual.empty:
+                            _act_date = _actual.iloc[0]["draw_date"]
+                            _act_nums = {
+                                int(_actual.iloc[0][f"n{i}"])
+                                for i in range(1, _gcfg.picks + 1)
+                                if pd.notna(_actual.iloc[0].get(f"n{i}"))
+                            }
+                            _hits = [n for n in _nums if n in _act_nums]
+                            _hit_count = len(_hits)
+                            _result_line = " ".join(
+                                (f"✅ **{n:02d}**" if n in _act_nums else f"❌ {n:02d}")
+                                for n in _nums
+                            )
+                            st.markdown(
+                                f"**{_check_label} ({_act_date}):**  {_result_line}  "
+                                f"→  **{_hit_count}/{_gcfg.picks} matched**"
+                            )
+                            _win_combo_md = "  ·  ".join(f"**{n:02d}**" for n in sorted(_act_nums))
+                            st.markdown(f"### 🏅 Winning: {_win_combo_md}")
+                            if _hit_count == _gcfg.picks:
+                                st.success("🏆 JACKPOT — all numbers matched!")
+                            elif _hit_count >= _gcfg.picks - 1:
+                                st.info(f"Almost! {_hit_count} of {_gcfg.picks} matched.")
+
+                    # Persisted match result (populated by Refresh Results)
+                    _actual_json = _row.get("actual_draw")
+                    if pd.notna(_actual_json) and _actual_json:
+                        try:
+                            import json as _json_sv
+                            _actual_sv   = _json_sv.loads(_actual_json)
+                            _match_sv    = int(_row.get("match_count") or 0)
+                            _dists_sv    = _json_sv.loads(_row.get("number_distances") or "{}")
+                            _result_parts = []
+                            for _n in _nums:
+                                if _dists_sv.get(str(_n), {}).get("hit"):
+                                    _result_parts.append(f"✅ **{_n:02d}**")
+                                else:
+                                    _delta   = _dists_sv.get(str(_n), {}).get("delta", "?")
+                                    _closest = _dists_sv.get(str(_n), {}).get("closest_actual", "?")
+                                    _result_parts.append(f"❌ {_n:02d}(→{_closest}, Δ{_delta})")
+                            st.markdown(
+                                "**Saved result:** " + "  ·  ".join(_result_parts)
+                                + f"  →  **{_match_sv}/{_gcfg.picks} matched**"
+                            )
+                            if isinstance(_actual_sv, list) and _actual_sv:
+                                _sv_win_md = "  ·  ".join(f"**{n:02d}**" for n in sorted(int(x) for x in _actual_sv))
+                                st.markdown(f"### 🏅 Winning: {_sv_win_md}")
+                            if _match_sv == _gcfg.picks:
+                                st.success("🏆 JACKPOT — all numbers matched!")
+                            elif _match_sv >= _gcfg.picks - 1:
+                                st.info(f"Near miss! {_match_sv} of {_gcfg.picks} matched.")
+                        except Exception:
+                            pass
+
+                    if str(_row.get("reasoning_preview") or ""):
+                        _rp = str(_row["reasoning_preview"])
+                        st.caption(f"💬 {_rp}" + ("…" if len(_rp) >= 400 else ""))
+
+                    st.markdown("---")
+                    if st.button("🗑 Delete bet", key=f"del_{_row['id']}", type="secondary"):
+                        _dc = get_connection()
+                        try:
+                            _dc.execute("DELETE FROM saved_combinations WHERE id = ?",
+                                        [int(_row["id"])])
+                        finally:
+                            _dc.close()
+                        st.rerun()
+
+        # Export
+        st.markdown("---")
+        if not _bets_all.empty:
+            _export_df = _bets_all.drop(columns=["reasoning_preview"], errors="ignore")
+            st.download_button(
+                "⬇ Download all bets (CSV)",
+                data=_export_df.to_csv(index=False).encode("utf-8"),
+                file_name="my_bets.csv",
+                mime="text/csv",
+            )

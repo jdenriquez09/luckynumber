@@ -118,6 +118,53 @@ def validate_row(row: dict[str, Any], game_cfg: GameConfig) -> dict[str, Any]:
     return out
 
 
+def _compute_derived(cleaned: dict[str, Any], game_cfg: GameConfig) -> dict[str, Any]:
+    """Compute draw_sum, odd_count, high_count, consecutive_cnt, number_spread, covid_gap."""
+    picks = game_cfg.picks
+    if game_cfg.ordered:
+        num_keys = [f"pub_{i}" for i in range(1, picks + 1)]
+    else:
+        num_keys = [f"n{i}" for i in range(1, picks + 1)]
+
+    nums = [cleaned.get(k) for k in num_keys if cleaned.get(k) is not None]
+    if not nums:
+        return {}
+
+    try:
+        nums_int = sorted(int(n) for n in nums)
+    except (TypeError, ValueError):
+        return {}
+
+    pool_mid = (game_cfg.low_boundary + game_cfg.pool) / 2.0
+    draw_sum = sum(nums_int)
+    odd_count = sum(1 for n in nums_int if n % 2 == 1)
+    high_count = sum(1 for n in nums_int if n > pool_mid)
+    consec = sum(
+        1 for i in range(len(nums_int) - 1)
+        if nums_int[i + 1] - nums_int[i] == 1
+    )
+    spread = nums_int[-1] - nums_int[0] if len(nums_int) > 1 else 0
+
+    draw_date = cleaned.get("draw_date")
+    covid_gap = False
+    if draw_date:
+        try:
+            from datetime import date as _date
+            d = _date.fromisoformat(str(draw_date)[:10])
+            covid_gap = _date(2020, 3, 15) <= d <= _date(2020, 10, 31)
+        except (ValueError, TypeError):
+            pass
+
+    return {
+        "draw_sum": draw_sum,
+        "odd_count": odd_count,
+        "high_count": high_count,
+        "consecutive_cnt": consec,
+        "number_spread": spread,
+        "covid_gap": covid_gap,
+    }
+
+
 def load_and_clean(
     raw_rows: list[dict[str, Any]],
     game_cfg: GameConfig,
@@ -138,6 +185,7 @@ def load_and_clean(
             continue
 
         draw_time = cleaned.get("draw_time") or "21:00"
+        derived = _compute_derived(cleaned, game_cfg)
 
         try:
             conn.execute("""
@@ -145,9 +193,15 @@ def load_and_clean(
                     draw_date, weekday, game, draw_time,
                     pub_1, pub_2, pub_3, pub_4, pub_5, pub_6,
                     n1, n2, n3, n4, n5, n6,
-                    jackpot_php, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (draw_date, game, draw_time) DO NOTHING
+                    jackpot_php, notes,
+                    draw_sum, odd_count, high_count, consecutive_cnt, number_spread, covid_gap,
+                    winners_jackpot, winners_5match, winners_4match, winners_3match
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (draw_date, game, draw_time) DO UPDATE SET
+                    winners_jackpot = COALESCE(excluded.winners_jackpot, draws.winners_jackpot),
+                    winners_5match  = COALESCE(excluded.winners_5match,  draws.winners_5match),
+                    winners_4match  = COALESCE(excluded.winners_4match,  draws.winners_4match),
+                    winners_3match  = COALESCE(excluded.winners_3match,  draws.winners_3match)
             """, [
                 cleaned["draw_date"],
                 cleaned.get("weekday"),
@@ -161,6 +215,16 @@ def load_and_clean(
                 cleaned.get("n5"), cleaned.get("n6"),
                 cleaned.get("jackpot_php"),
                 cleaned.get("notes"),
+                derived.get("draw_sum"),
+                derived.get("odd_count"),
+                derived.get("high_count"),
+                derived.get("consecutive_cnt"),
+                derived.get("number_spread"),
+                derived.get("covid_gap"),
+                cleaned.get("winners_jackpot"),
+                cleaned.get("winners_5match"),
+                cleaned.get("winners_4match"),
+                cleaned.get("winners_3match"),
             ])
             inserted += 1
         except Exception as exc:

@@ -14,7 +14,7 @@ G655 = GAMES["655"]
 SAMPLE_HTML = """
 <html><body>
 <table>
-  <tr><th>Date</th><th>Result</th><th>Jackpot</th></tr>
+  <tr><th>Draw Date</th><th>Winning Numbers</th><th>Jackpot</th></tr>
   <tr><td>Monday, January 06, 2025</td><td>05-12-23-34-45-55</td><td>50,000,000.00</td></tr>
   <tr><td>Wednesday, January 08, 2025</td><td>01-07-14-28-42-50</td><td>49,000,000.00</td></tr>
   <tr><td>Saturday, January 11, 2025</td><td>03-15-22-31-40-53</td><td>51,000,000.00</td></tr>

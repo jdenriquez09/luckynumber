@@ -639,7 +639,7 @@ def structural_break(df: pd.DataFrame, game_cfg: GameConfig) -> AnalysisResult:
 
     def _freq(part):
         _raw = pd.array(part[num_cols].values.flatten(), dtype=object)
-        nums = np.array([x for x in _raw if x is not None and not (isinstance(x, float) and np.isnan(x))], dtype=int)
+        nums = np.array([x for x in _raw if not pd.isna(x)], dtype=int)
         return pd.Series(nums).value_counts().reindex(pool, fill_value=0).values
 
     f1, f2 = _freq(first), _freq(second)
@@ -679,7 +679,7 @@ def entropy_score(df: pd.DataFrame, game_cfg: GameConfig) -> AnalysisResult:
     pool_size = len(pool)
 
     all_nums = pd.array(df[num_cols].values.flatten(), dtype=object)
-    all_nums = np.array([x for x in all_nums if x is not None and not (isinstance(x, float) and np.isnan(x))], dtype=int)
+    all_nums = np.array([x for x in all_nums if not pd.isna(x)], dtype=int)
     counts = pd.Series(all_nums).value_counts().reindex(pool, fill_value=0)
     probs = counts / counts.sum()
 
@@ -692,7 +692,7 @@ def entropy_score(df: pd.DataFrame, game_cfg: GameConfig) -> AnalysisResult:
     year_rows = []
     for year, grp in df2.groupby("year"):
         _yr = pd.array(grp[num_cols].values.flatten(), dtype=object)
-        yn = np.array([x for x in _yr if x is not None and not (isinstance(x, float) and np.isnan(x))], dtype=int)
+        yn = np.array([x for x in _yr if not pd.isna(x)], dtype=int)
         yc = pd.Series(yn).value_counts().reindex(pool, fill_value=0)
         yp = yc / yc.sum()
         ye = float(scipy_entropy(yp.values + 1e-12, base=2))
@@ -725,7 +725,7 @@ def power_analysis(df: pd.DataFrame, game_cfg: GameConfig) -> AnalysisResult:
     n = len(df.dropna(subset=num_cols))
 
     all_nums = pd.array(df[num_cols].values.flatten(), dtype=object)
-    all_nums = np.array([x for x in all_nums if x is not None and not (isinstance(x, float) and np.isnan(x))], dtype=int)
+    all_nums = np.array([x for x in all_nums if not pd.isna(x)], dtype=int)
     counts = pd.Series(all_nums).value_counts().reindex(pool, fill_value=0)
     total_obs = int(counts.sum())
     expected_p = k / pool_size
@@ -947,4 +947,87 @@ def never_drawn_patterns(df: pd.DataFrame, game_cfg: GameConfig) -> AnalysisResu
         name="Never-Drawn Pairs", table=pd.DataFrame(rows), conclusion=conclusion,
         meta={"total_pairs": len(all_pairs), "never_pairs": len(never_p),
               "drawn_pairs": len(drawn_pairs)}
+    )
+
+
+def sequential_bias_test(df: pd.DataFrame, game_cfg: GameConfig) -> AnalysisResult:
+    """
+    Track each number's cumulative appearance count vs expected over every draw.
+
+    A truly random draw keeps per-number Z-scores within ±2σ ~95% of the time.
+    Sustained deviation (Z consistently above +2 or below -2) is a mechanical
+    bias signal — the longer it persists, the less likely it is pure noise.
+
+    Returns snapshot table (final state) ranked by |z_score|.
+    Meta includes the full time-series for charting.
+    """
+    from math import sqrt
+
+    num_cols = [f"n{i}" for i in range(1, game_cfg.picks + 1)]
+    pool = list(range(game_cfg.low_boundary, game_cfg.pool + 1))
+    pool_size = len(pool)
+    p = game_cfg.picks / pool_size  # P(any one number appears per draw)
+
+    clean = df.dropna(subset=num_cols).sort_values("draw_date").reset_index(drop=True)
+    counts: dict[int, int] = {n: 0 for n in pool}
+
+    # time series: {number: [(draw_idx, z_score), ...]}
+    series: dict[int, list[tuple[int, float]]] = {n: [] for n in pool}
+
+    for i, row in enumerate(clean.itertuples(), 1):
+        drawn = {int(getattr(row, c)) for c in num_cols if pd.notna(getattr(row, c))}
+        for n in pool:
+            if n in drawn:
+                counts[n] += 1
+
+        if i % 10 == 0 or i == len(clean):
+            expected = i * p
+            std = sqrt(i * p * (1 - p)) if i * p * (1 - p) > 0 else 1e-9
+            for n in pool:
+                z = (counts[n] - expected) / std
+                series[n].append((i, round(z, 4)))
+
+    # Final snapshot
+    n_draws = len(clean)
+    expected_final = n_draws * p
+    std_final = sqrt(n_draws * p * (1 - p)) if n_draws * p * (1 - p) > 0 else 1e-9
+
+    rows = []
+    for n in pool:
+        z = (counts[n] - expected_final) / std_final
+        rows.append({
+            "number": n,
+            "appearances": counts[n],
+            "expected": round(expected_final, 1),
+            "z_score": round(z, 3),
+            "bias": "HOT 🔴" if z > 2 else ("COLD 🔵" if z < -2 else "normal ✅"),
+            "significance": "p<0.05" if abs(z) > 1.96 else ("p<0.10" if abs(z) > 1.645 else "ns"),
+        })
+
+    table = pd.DataFrame(rows).sort_values("z_score", ascending=False).reset_index(drop=True)
+
+    hot = [r["number"] for r in rows if r["z_score"] > 2]
+    cold = [r["number"] for r in rows if r["z_score"] < -2]
+    pct_outside = len(hot) + len(cold)
+
+    conclusion = (
+        f"Over {n_draws} draws, {pct_outside} of {pool_size} numbers ({pct_outside/pool_size*100:.1f}%) "
+        f"fall outside the ±2σ band (expected ~5% by chance). "
+        + (f"Hot (over-represented): {hot}. " if hot else "No significantly hot numbers. ")
+        + (f"Cold (under-represented): {cold}. " if cold else "No significantly cold numbers. ")
+        + ("Potential bias signal worth monitoring." if pct_outside > pool_size * 0.08
+           else "Distribution consistent with randomness.")
+    )
+
+    return AnalysisResult(
+        name="Sequential Bias Test",
+        table=table,
+        conclusion=conclusion,
+        meta={
+            "n_draws": n_draws,
+            "hot_numbers": hot,
+            "cold_numbers": cold,
+            "pct_outside_2sigma": round(pct_outside / pool_size * 100, 1),
+            "time_series": series,  # {number: [(draw_idx, z_score), ...]}
+        },
     )

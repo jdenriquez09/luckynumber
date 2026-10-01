@@ -27,7 +27,11 @@ def _get_number_cols(game_cfg: GameConfig) -> list[str]:
 
 def _clean_draws(df: pd.DataFrame, game_cfg: GameConfig) -> pd.DataFrame:
     cols = _get_number_cols(game_cfg)
-    return df.dropna(subset=cols).copy()
+    clean = df.dropna(subset=cols).copy()
+    sort_cols = [c for c in ("draw_date", "draw_time") if c in clean.columns]
+    if sort_cols:
+        clean = clean.sort_values(sort_cols, kind="stable")
+    return clean.reset_index(drop=True)
 
 
 def number_heat_map(
@@ -70,9 +74,9 @@ def number_heat_map(
     # All numbers in pool
     all_nums = list(range(game_cfg.low_boundary, game_cfg.pool + 1))
 
-    # Total frequency across all draws
-    all_flat = clean[cols].values.flatten().astype(float)
-    all_flat = all_flat[~np.isnan(all_flat)].astype(int)
+    # Total frequency across all draws (safe for nullable Int64 columns)
+    all_raw = pd.array(clean[cols].values.flatten(), dtype=object)
+    all_flat = np.array([int(v) for v in all_raw if v is not None and not pd.isna(v)])
     total_counts = pd.Series(all_flat).value_counts()
 
     # Recent frequency — last `window` draws
@@ -82,8 +86,8 @@ def number_heat_map(
         recent_df = clean
 
     n_recent = len(recent_df)
-    recent_flat = recent_df[cols].values.flatten().astype(float)
-    recent_flat = recent_flat[~np.isnan(recent_flat)].astype(int)
+    recent_raw = pd.array(recent_df[cols].values.flatten(), dtype=object)
+    recent_flat = np.array([int(v) for v in recent_raw if v is not None and not pd.isna(v)])
     recent_counts = pd.Series(recent_flat).value_counts()
     expected_recent = n_recent * expected_per_draw
 
@@ -112,8 +116,8 @@ def number_heat_map(
         # Heat score: ratio of recent frequency to expected (clamped)
         heat = (rc / max(expected_recent, 1e-9)) if expected_recent > 0 else 1.0
 
-        # Gap score: expected_gap / current_gap — high = overdue, low = recently appeared
-        gap_s = expected_gap / max(cg, 1)
+        # Gap score: overdue numbers score high, recently-drawn score low
+        gap_s = min(cg / expected_gap, 3.0) / 3.0
 
         # Composite: average of heat and gap scores, then normalise across numbers later
         composite_raw = 0.5 * heat + 0.5 * gap_s
@@ -146,6 +150,41 @@ def number_heat_map(
     return result.sort_values("composite_score", ascending=False).reset_index(drop=True)
 
 
+def random_combinations(
+    game_cfg: GameConfig,
+    n: int = 5,
+    seed: int | None = None,
+) -> list[list[int]]:
+    """Uniform random tickets, with no historical or model weighting.
+
+    Ordered games preserve positions and allow repeats. Unordered tickets have
+    distinct numbers and are sorted. Duplicate tickets are excluded; requesting
+    more than the finite ticket space returns that space, in random order.
+    A supplied seed makes the output reproducible, not predictive.
+    """
+    from math import comb
+    from numbers import Integral
+
+    if isinstance(n, bool) or not isinstance(n, Integral) or n < 0:
+        raise ValueError("n must be a non-negative integer")
+    size = game_cfg.pool - game_cfg.low_boundary + 1
+    if size < 1 or game_cfg.picks < 1 or (not game_cfg.ordered and game_cfg.picks > size):
+        raise ValueError("Invalid game pool or pick count")
+    total = size ** game_cfg.picks if game_cfg.ordered else comb(size, game_cfg.picks)
+    target = min(n, total)
+    rng = np.random.default_rng(seed)
+    pool = np.arange(game_cfg.low_boundary, game_cfg.pool + 1)
+    seen: set[tuple[int, ...]] = set()
+    result: list[list[int]] = []
+    while len(result) < target:
+        chosen = rng.choice(pool, size=game_cfg.picks, replace=game_cfg.ordered)
+        ticket = tuple(int(x) for x in (chosen if game_cfg.ordered else np.sort(chosen)))
+        if ticket not in seen:
+            seen.add(ticket)
+            result.append(list(ticket))
+    return result
+
+
 def suggest_combinations(
     df: pd.DataFrame,
     game_cfg: GameConfig,
@@ -154,58 +193,29 @@ def suggest_combinations(
     seed: int | None = None,
     draw_time: str | None = None,
 ) -> list[list[int]]:
-    """
-    Generate n combinations by weighted random sampling (without replacement per combo).
-    Weight = composite_score clamped to >= 0.01 so every number has non-zero probability.
-    Returns each combination sorted ascending.
-    """
-    rng = np.random.default_rng(seed)
+    """Compatibility wrapper for uniform sampling, stable for a data snapshot.
 
-    # Ordered games (2D/3D/4D/6D): sample each position independently
-    if game_cfg.ordered:
-        pos_heat = position_heat_map(df, game_cfg, draw_time=draw_time)
-        if not pos_heat:
-            return []
-        seen: set[tuple] = set()
-        combos: list[list[int]] = []
-        max_attempts = n * 20
-        attempts = 0
-        while len(combos) < n and attempts < max_attempts:
-            attempts += 1
-            digits = []
-            for pos in range(1, game_cfg.picks + 1):
-                ph = pos_heat[pos]
-                w = np.clip(ph["deviation_z"].values + 2.0, 0.01, None)
-                w = w / w.sum()
-                digits.append(int(rng.choice(ph["digit"].values, p=w)))
-            key = tuple(digits)
-            if key not in seen:
-                seen.add(key)
-                combos.append(list(digits))
-        return combos
-
-    heat = number_heat_map(df, game_cfg, window=window, draw_time=draw_time)
-    if heat.empty:
+    History, window and draw time affect only the default reproducibility seed;
+    they never weight or exclude numbers. Empty filtered history returns no tickets.
+    """
+    if window is not None and window < 1:
+        raise ValueError("window must be positive")
+    if draw_time is not None and "draw_time" in df.columns:
+        df = df[df["draw_time"] == draw_time]
+    if df.empty:
         return []
-
-    numbers = heat["number"].values
-    weights = np.clip(heat["composite_score"].values, 0.01, None)
-    weights = weights / weights.sum()
-
-    seen_s: set[frozenset] = set()
-    combos_s: list[list[int]] = []
-    max_attempts = n * 20
-    attempts = 0
-    while len(combos_s) < n and attempts < max_attempts:
-        attempts += 1
-        chosen = rng.choice(numbers, size=game_cfg.picks, replace=False, p=weights)
-        combo = sorted(int(x) for x in chosen)
-        key = frozenset(combo)
-        if key not in seen_s:
-            seen_s.add(key)
-            combos_s.append(combo)
-
-    return combos_s
+    clean = _clean_draws(df, game_cfg)
+    if window is not None:
+        clean = clean.tail(window)
+    if clean.empty:
+        return []
+    if seed is None:
+        import hashlib
+        cols = [c for c in ("draw_date", "draw_time", *_get_number_cols(game_cfg)) if c in clean]
+        snapshot = pd.util.hash_pandas_object(clean[cols], index=False).values.tobytes()
+        digest = hashlib.sha256(f"uniform-v1|{game_cfg.id}|{window}|{draw_time}".encode() + snapshot)
+        seed = int.from_bytes(digest.digest()[:8], "big")
+    return random_combinations(game_cfg, n=n, seed=seed)
 
 
 def position_heat_map(
@@ -433,3 +443,82 @@ def score_user_combination(
 
     result["commentary"] = lines
     return result
+
+
+# ===========================================================================
+# Feature: Combination History Lookup
+# ===========================================================================
+
+def find_combination_history(
+    combo: list,
+    game_cfg,
+    df,
+) -> dict:
+    """
+    Check whether a combination has ever been drawn before.
+
+    For unordered games (pick-6, 4D, 6D): compares sorted number sets.
+    For ordered games (2D, 3D):           compares published digit order (pub_1..pub_n).
+
+    Returns
+    -------
+    {
+        "combo":        sorted list of numbers queried,
+        "found":        bool,
+        "times_drawn":  int,
+        "draws":        DataFrame with columns [draw_date, draw_time, jackpot_php, notes]
+                        (one row per matching draw, sorted ascending),
+        "last_drawn":   str date or None,
+        "first_drawn":  str date or None,
+    }
+    """
+    import pandas as pd
+    import numpy as np
+
+    picks = game_cfg.picks
+    nums = sorted(int(n) for n in combo)
+
+    if game_cfg.ordered:
+        # Use published columns (position matters for 2D/3D)
+        pub_cols = [f"pub_{i}" for i in range(1, picks + 1)]
+        use_cols = pub_cols if all(c in df.columns for c in pub_cols) else [f"n{i}" for i in range(1, picks + 1)]
+        df_c = df.dropna(subset=use_cols).copy()
+        def _matches(row):
+            return [int(row[c]) for c in use_cols] == nums
+    else:
+        # Sorted set match for unordered games
+        num_cols = [f"n{i}" for i in range(1, picks + 1)]
+        df_c = df.dropna(subset=num_cols).copy()
+        def _matches(row):
+            vals = sorted(int(row[c]) for c in num_cols)
+            return vals == nums
+
+    mask = df_c.apply(_matches, axis=1)
+    hits = df_c[mask].copy()
+
+    if hits.empty:
+        return {
+            "combo": nums, "found": False, "times_drawn": 0,
+            "draws": pd.DataFrame(), "last_drawn": None, "first_drawn": None,
+        }
+
+    hits = hits.sort_values("draw_date")
+    keep_cols = ["draw_date"]
+    if "draw_time" in hits.columns:
+        keep_cols.append("draw_time")
+    if "jackpot_php" in hits.columns:
+        keep_cols.append("jackpot_php")
+    if "notes" in hits.columns:
+        keep_cols.append("notes")
+
+    result_df = hits[keep_cols].copy()
+    result_df["draw_date"] = result_df["draw_date"].astype(str).str[:10]
+
+    return {
+        "combo": nums,
+        "found": True,
+        "times_drawn": len(result_df),
+        "draws": result_df.reset_index(drop=True),
+        "first_drawn": result_df["draw_date"].iloc[0],
+        "last_drawn": result_df["draw_date"].iloc[-1],
+    }

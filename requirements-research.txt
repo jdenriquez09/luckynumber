@@ -1,0 +1,9 @@
+# Optional legacy experiments; not needed by the dashboard/API generation path.
+# These models have not demonstrated better lottery odds on an untouched test set.
+-r requirements.txt
+xgboost>=2.0.0
+lightgbm>=4.0.0
+shap>=0.45.0
+networkx>=3.0
+optuna>=3.6.0
+torch>=2.2.0
