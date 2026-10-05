@@ -21,7 +21,8 @@ from .games import GameConfig
 BURN_IN = 30
 MIN_DRAWS = 100
 SCORE_FLOOR = 1e-12
-FEATURE_NAMES = ("frequency_last10", "frequency_last30", "frequency_all")
+FEATURE_NAMES = ("frequency_last10", "frequency_last30", "frequency_all",
+                 "gap_normalized", "trend", "recency_weight")
 CAUTION = (
     "Historical scoring and an approximate draw-level t interval do not prove "
     "a winning advantage. The interval assumes independent draw-level errors; "
@@ -151,12 +152,37 @@ def _build_snapshots(clean: pd.DataFrame, game_cfg: GameConfig) -> HistoricalSna
     if game_cfg.ordered:
         names += tuple(f"position_{i}" for i in range(1, positions + 1))
 
+    # Pre-compute last-seen draw index for gap/recency features.
+    last_seen_at = np.full((len(clean) + 1, positions, size), -1.0)
+    for i in range(len(clean)):
+        last_seen_at[i + 1] = last_seen_at[i]
+        if game_cfg.ordered:
+            for pos_idx in range(positions):
+                last_seen_at[i + 1, pos_idx, numbers[i, pos_idx]] = float(i)
+        else:
+            for num_val in numbers[i]:
+                last_seen_at[i + 1, 0, num_val] = float(i)
+
+    expected_gap = size / (1 if game_cfg.ordered else game_cfg.picks)
+
     def features(t: int) -> np.ndarray:
         frequencies = []
         for length in (10, 30, t):
             start = max(0, t - length)
             frequencies.append(((prefix[t] - prefix[start] + prior) / (t - start + 1)).reshape(-1))
-        result = np.column_stack(frequencies)
+        freq_features = np.column_stack(frequencies)
+
+        # Gap: how many draws since last appearance, normalised by expected gap.
+        raw_gaps = np.where(last_seen_at[t] >= 0, t - last_seen_at[t], t + 1).reshape(-1)
+        gap_norm = np.minimum(raw_gaps / expected_gap, 3.0) / 3.0
+
+        # Trend: recent momentum (positive = heating up).
+        trend_vals = frequencies[0] - frequencies[1]
+
+        # Recency: exponential decay shaped by game's expected gap.
+        recency = np.exp(-raw_gaps / expected_gap)
+
+        result = np.column_stack((freq_features, gap_norm, trend_vals, recency))
         return np.column_stack((result, one_hot)) if game_cfg.ordered else result
 
     indices = np.arange(BURN_IN, len(clean), dtype=int)
@@ -271,8 +297,13 @@ def _sample_combinations(
 def generate_ml_combinations(
     df: pd.DataFrame, game_cfg: GameConfig, n: int = 5,
     window: int | None = None, draw_time: str | None = None, seed: int | None = 42,
+    bet_feedback: dict[int, float] | None = None,
 ) -> dict:
     """Score candidates, evaluate chronologically, and sample unique tickets.
+
+    bet_feedback optionally maps a number to a multiplier learned from the
+    user's scored past bets; it rescales the production scores (capped at 1)
+    before sampling and is not part of the chronological evaluation.
 
     Requires >=100 validated, windowed draws, with the first 30 as burn-in.
     Multiple observed slots require an explicit draw_time (otherwise fallback);
@@ -337,6 +368,15 @@ def generate_ml_combinations(
         "test_start": snapshots.provenance[split],
     })
     probabilities = np.maximum(production_model.predict_proba(snapshots.next_X)[:, 1], SCORE_FLOOR)
+    feedback_applied = 0
+    if bet_feedback:
+        multipliers = np.ones(len(probabilities))
+        for index in range(len(probabilities)):
+            number = index % size + game_cfg.low_boundary
+            if number in bet_feedback:
+                multipliers[index] = float(bet_feedback[number])
+                feedback_applied += 1
+        probabilities = np.clip(probabilities * multipliers, SCORE_FLOOR, 1.0)
     scores = []
     for index, probability in enumerate(probabilities):
         record = {"number": index % size + game_cfg.low_boundary, "score": float(probability)}
@@ -344,7 +384,7 @@ def generate_ml_combinations(
             record["position"] = index // size + 1
         scores.append(record)
     coefficients = production_model.named_steps["classifier"].coef_[0]
-    return {
+    generation = {
         "method": "logistic_regression",
         "combinations": _sample_combinations(game_cfg, probabilities, n, seed),
         "scores": scores, "evaluation": evaluation,
@@ -352,3 +392,6 @@ def generate_ml_combinations(
         "reason": f"Untuned logistic scoring; separate chronological evaluation and production fit. {CAUTION}",
         "training_draws": len(snapshots.X),
     }
+    if feedback_applied:
+        generation["bet_feedback_numbers"] = feedback_applied
+    return generation

@@ -7,17 +7,22 @@ Pages:
   3. Statistical Tests
   4. Completeness Report
 """
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import streamlit as st
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from api.db import get_connection, compare_with_actual
+from api.db import (
+    get_connection, compare_with_actual, save_ml_run, load_bet_history,
+    bet_number_feedback, latest_ml_run,
+)
 from src.lotto.games import GAMES
 import src.lotto.analysis as an
 from src.lotto.clean import completeness_report
@@ -73,15 +78,18 @@ def load_draws(game_id: str) -> pd.DataFrame:
 @st.cache_data(max_entries=32, show_spinner=False)
 def _prob_generation(_df: pd.DataFrame, dataset_hash: str, game_id: str,
                      window: int | None, draw_time: str, n: int,
-                     mode: str, model_version: str) -> dict:
+                     mode: str, model_version: str, feedback_json: str = "") -> dict:
     """Cache per-slot tickets/metrics; explicit snapshot and version key _df."""
+    import json as _json
     from src.lotto.lean_ml import generate_ml_combinations, _prepare_draws
     from src.lotto.predict import random_combinations
 
     cfg = GAMES[game_id]
     if mode == "ML-assisted":
+        feedback = {int(k): float(v) for k, v in _json.loads(feedback_json).items()} if feedback_json else None
         return generate_ml_combinations(
             _df, cfg, n=n, window=window, draw_time=draw_time, seed=42,
+            bet_feedback=feedback,
         )
     return {
         "method": "uniform_fallback",
@@ -139,7 +147,7 @@ def _show_interp(template_msg: str, key_facts: str, game_name: str,
 
 PAGES = [
     "Raw Data", "Frequency Analysis", "Statistical Tests", "Completeness",
-    "Probability & AI", "Backtest", "Advanced Stats", "Combo Tools",
+    "Probability & AI", "Strategy Arena", "Backtest", "Advanced Stats", "Combo Tools",
     "Gambler's Edge", "Data Quality", "Saved Combos",
 ]
 page = st.sidebar.radio("Navigate", PAGES)
@@ -1643,12 +1651,18 @@ elif page == "Probability & AI":
         f"ai_combo_lean_v1_{_LEAN_ML_VERSION}_{game_id}_{window}_{_data_hash}"
         f"_{generation_mode}_{n_combos}"
     )
+    # Per-number feedback learned from scored bets; refreshed only when the
+    # Generate button is clicked (no database access while rendering).
+    _feedback_key = f"bet_feedback_{game_id}"
+    _pending_ai_key = f"pending_ai_{game_id}"
+    _feedback_json = st.session_state.get(_feedback_key, "")
+
     # One source of truth for display and the optional AI explanation.
     with st.spinner("Preparing combinations and chronological evaluation…"):
         generation_by_label = {
             _TIME_LABELS.get(dt, dt): _prob_generation(
                 df, _data_hash, game_id, window, dt, n_combos,
-                generation_mode, _LEAN_ML_VERSION,
+                generation_mode, _LEAN_ML_VERSION, _feedback_json,
             )
             for dt in game_cfg.draw_times
         }
@@ -1727,6 +1741,7 @@ elif page == "Probability & AI":
 
         def _build_slots_data():
             """Use the generator's validated history and exact displayed tickets."""
+            from src.lotto.predict import heat_map_summary as _hm_summary
             slots = []
             for dt in game_cfg.draw_times:
                 label = _TIME_LABELS.get(dt, dt)
@@ -1744,9 +1759,16 @@ elif page == "Probability & AI":
                             "number": number, "total_draws": int(counts.get(number, 0)),
                             **({"position": position} if position is not None else {}),
                         })
+                # Add heat map summary for unordered games
+                heat_summary_text = ""
+                if not game_cfg.ordered:
+                    slot_heat = heat_by_time.get(dt, heat) if is_multi_draw else heat
+                    if not slot_heat.empty:
+                        heat_summary_text = _hm_summary(slot_heat)
                 slots.append({
                     "label": label, "heat_map_rows": rows, "total_draws": len(clean),
                     "generation": generation_by_label[label],
+                    "heat_summary": heat_summary_text,
                 })
             return slots
 
@@ -1821,7 +1843,8 @@ elif page == "Probability & AI":
                                            ?, ?, ?, ?, ?, 'bet', ?, 'pending', ?)""",
                                 [game_cfg.id, _dt_save, _combo_formatted,
                                  res.get("reasoning"), _label_val or None,
-                                 _bet_date_val, None],
+                                 _bet_date_val,
+                                 st.session_state.get(f"{_ai_combo_key}_runids", {}).get(slot_label)],
                             )
                             _conn_sv.close()
                             st.toast(f"Bet saved: {_combo_formatted}", icon="🎯")
@@ -1835,7 +1858,23 @@ elif page == "Probability & AI":
                 if not res.get("combination") and not res.get("reasoning"):
                     st.warning("AI returned an empty response. Click Regenerate to try again.")
 
-        generate_requested = st.button("Generate / Regenerate AI Explanation", key="regen_ai")
+        _clicked = st.button("Generate / Regenerate AI Explanation", key="regen_ai")
+        generate_requested = _clicked or st.session_state.pop(_pending_ai_key, False)
+        if _clicked:
+            load_draws.clear()
+            _prob_generation.clear()
+            try:
+                compare_with_actual(game_id)
+                _new_feedback = bet_number_feedback(game_id)
+            except Exception as _fb_exc:
+                st.warning(f"Could not score past bets: {_fb_exc}")
+                _new_feedback = {}
+            _new_json = json.dumps(_new_feedback, sort_keys=True) if _new_feedback else ""
+            if _new_json != _feedback_json:
+                # Tickets above were built with the old feedback; rebuild, then run the AI.
+                st.session_state[_feedback_key] = _new_json
+                st.session_state[_pending_ai_key] = True
+                st.rerun()
         if generate_requested:
             st.session_state.pop(_ai_combo_key, None)
             st.session_state.pop(f"{_ai_combo_key}_prompt", None)
@@ -1853,6 +1892,14 @@ elif page == "Probability & AI":
                         chi_result = _an.freq_chi_square(df, game_cfg).conclusion
                         gap_result = _an.gap_analysis(df, game_cfg).conclusion
 
+                    # Compute trend summary from heat map data
+                    _trend_summary = None
+                    if not game_cfg.ordered and not heat.empty:
+                        _trend_summary = {
+                            "heating_up": heat.nlargest(5, "heat_score")["number"].tolist(),
+                            "cooling_down": heat.nsmallest(5, "heat_score")["number"].tolist(),
+                        }
+
                     _slots = [slot for slot in _build_slots_data() if slot["heat_map_rows"]]
                     ai_results = ai_client.interpret_lotto_stats(
                         game_name=game_cfg.name,
@@ -1860,7 +1907,34 @@ elif page == "Probability & AI":
                         chi_sq_result=chi_result,
                         gap_result=gap_result,
                         picks=game_cfg.picks,
+                        trend_summary=_trend_summary,
+                        prior_run_feedback=load_bet_history(game_id),
                     )
+                    _run_ids: dict[str, int] = {}
+                    for _slot_label, _slot_res in ai_results.items():
+                        _gen = _slot_res.get("generation") or {}
+                        _evaluation = _gen.get("evaluation") or {}
+                        try:
+                            _run_ids[_slot_label] = save_ml_run(
+                                game=game_cfg.id,
+                                draw_time=_slot_label if is_multi_draw else None,
+                                as_of_date=_prob_latest_date,
+                                n_training_draws=int(_gen.get("training_draws") or 0),
+                                model_version=_LEAN_ML_VERSION,
+                                feature_importance=_gen.get("feature_weights") or None,
+                                number_probs=(
+                                    {r["number"]: r["score"] for r in _gen["scores"]}
+                                    if _gen.get("scores") and not game_cfg.ordered else None
+                                ),
+                                top_combinations=_gen.get("combinations"),
+                                ai_combination=_slot_res.get("combination"),
+                                ai_reasoning=_slot_res.get("reasoning"),
+                                ai_prompt_text=ai_client.last_prompt,
+                                brier_score=_evaluation.get("model_brier"),
+                            )
+                        except Exception as _run_exc:
+                            st.warning(f"Could not store AI run: {_run_exc}")
+                    st.session_state[f"{_ai_combo_key}_runids"] = _run_ids
                     st.session_state[_ai_combo_key] = ai_results
                     st.session_state[f"{_ai_combo_key}_prompt"] = ai_client.last_prompt
                     st.rerun()
@@ -2096,12 +2170,22 @@ elif page == "Probability & AI":
 
     # --- Full AI Prompt (copy & paste into other AI models) ---
     _saved_prompt = st.session_state.get(f"{_ai_combo_key}_prompt", "")
+    _prompt_note = ""
+    if not _saved_prompt:
+        try:
+            _stored_run = latest_ml_run(game_id)
+        except Exception:
+            _stored_run = None
+        if _stored_run:
+            _saved_prompt = _stored_run["prompt"]
+            _prompt_note = f" Restored from the stored run of {_stored_run['run_at'][:16]}."
     if _saved_prompt:
         st.markdown("---")
         with st.expander("📋 Full prompt sent to AI — copy to run in Claude / Gemini / other models"):
             st.caption(
                 "This is the exact prompt sent to the Azure OpenAI model. "
                 "Paste it into Claude, Gemini, GPT-4, or any other AI to compare results."
+                + _prompt_note
             )
             st.code(_saved_prompt, language="text")
 
@@ -2173,6 +2257,239 @@ elif page == "Backtest":
                 _b_tbl["predicted"] = _b_tbl["predicted"].apply(lambda x: "-".join(map(str, x)))
                 _b_tbl["actual"] = _b_tbl["actual"].apply(lambda x: "-".join(map(str, x)))
                 st.dataframe(_b_tbl, use_container_width=True)
+
+
+# ===========================================================================
+# Page: Strategy Arena
+# ===========================================================================
+elif page == "Strategy Arena":
+    import datetime as _dt_arena
+    import secrets
+    import plotly.express as _px
+    from src.lotto.azure_ai import AzureAIClient
+    from src.lotto.arena import (
+        STRATEGY_LABELS as _ARENA_LABELS, available_strategies as _arena_available,
+        ai_shortlist as _arena_shortlist, next_draw_tickets as _arena_next,
+        run_arena as _run_arena,
+    )
+    from src.lotto.crowd import crowd_games as _crowd_games, fit_crowd_model as _fit_crowd
+
+    @st.cache_resource(ttl=3600, show_spinner=False)
+    def _crowd_model():
+        return _fit_crowd({g.id: load_draws(g.id) for g in _crowd_games()})
+
+    st.title("🏟️ Strategy Arena")
+    st.caption(
+        "Every strategy generates tickets for each past draw using only the draws before it. "
+        "Average matches are tested against the exact random expectation, with p-values adjusted "
+        "for the number of strategies compared. Crowd-aware strategies also report how much of a "
+        "jackpot they would keep if they won."
+    )
+
+    _a_game = game_selector("Game")
+    _a_cfg = GAMES[_a_game]
+    _a_df = load_draws(_a_game)
+    _a_crowd = _crowd_model()
+    _a_has_crowd = (_a_crowd is not None and not _a_cfg.ordered and _a_game in _a_crowd.game_ids)
+    _a_options = _arena_available(_a_cfg, _a_crowd)
+
+    _a1, _a2, _a3 = st.columns(3)
+    with _a1:
+        _a_dt = (st.selectbox("Draw time", list(_a_cfg.draw_times))
+                 if len(_a_cfg.draw_times) > 1 else _a_cfg.draw_times[0])
+    with _a2:
+        _a_test = st.slider("Draws to test", 100, 1000, 300, 50)
+    with _a3:
+        _a_tickets = st.slider("Tickets per draw", 1, 20, 5)
+    _a_chosen = st.multiselect(
+        "Strategies", _a_options, default=_a_options, format_func=lambda k: _ARENA_LABELS[k],
+    )
+
+    _a_run_key = f"arena_{_a_game}_{_a_dt}_{_a_test}_{_a_tickets}_{'-'.join(_a_chosen)}"
+    if st.button("▶ Run Arena", type="primary", disabled=len(_a_chosen) < 1):
+        _bar = st.progress(0.0, text="Walking forward through history…")
+        try:
+            st.session_state[_a_run_key] = _run_arena(
+                _a_df, _a_cfg, strategies=_a_chosen, test_draws=_a_test,
+                tickets_per_draw=_a_tickets, draw_time=_a_dt, crowd=_a_crowd,
+                on_progress=lambda f: _bar.progress(min(f, 1.0)),
+            )
+        except Exception as _a_exc:
+            st.error(f"Arena failed: {_a_exc}")
+        _bar.empty()
+
+    _a_res = st.session_state.get(_a_run_key)
+    if _a_res is not None:
+        _a_meta = _a_res.meta
+        st.info(_a_res.conclusion)
+        st.caption(
+            f"{_a_meta['test_draws']} draws from {_a_meta['first_test_date']} to "
+            f"{_a_meta['last_test_date']}, {_a_meta['tickets_per_draw']} tickets per draw. "
+            f"Random play averages {_a_meta['expected_matches']:.4f} matches per ticket."
+        )
+        _a_table = _a_res.table.drop(columns=["key"])
+        _a_formats = {
+            "mean_matches": "{:.4f}", "expected_random": "{:.4f}", "edge_pct": "{:+.2f}%",
+            "z": "{:+.2f}", "p_value": "{:.3f}", "p_adjusted": "{:.3f}",
+            "jackpot_share_kept": "{:.4f}", "share_gain_pct": "{:+.2f}%",
+        }
+        _a_formats.update({c: "{:.1%}" for c in _a_table.columns if c.startswith("draws_with_")})
+        st.dataframe(
+            _a_table.style.format({k: v for k, v in _a_formats.items() if k in _a_table.columns}),
+            hide_index=True, use_container_width=True,
+        )
+        _a_pd = _a_meta["per_draw"].copy()
+        _a_pd["cumulative_edge_pct"] = _a_pd.groupby("strategy")["mean_matches"].transform(
+            lambda s: (s.expanding().mean() / _a_meta["expected_matches"] - 1) * 100
+        )
+        _a_pd["strategy"] = _a_pd["strategy"].map(_ARENA_LABELS)
+        st.plotly_chart(
+            _px.line(_a_pd, x="draw_date", y="cumulative_edge_pct", color="strategy",
+                     title="Cumulative edge over random (average matches per ticket, %)",
+                     labels={"cumulative_edge_pct": "edge vs random (%)", "draw_date": ""}),
+            use_container_width=True,
+        )
+
+        _a_ai_key = f"{_a_run_key}_ai"
+        _a_ai_client = AzureAIClient()
+        if not _a_ai_client.is_configured():
+            st.caption("AI analysis is unavailable until Azure AI is configured.")
+        else:
+            if st.button("🤖 AI analysis of these results", key="arena_ai"):
+                _a_next = st.session_state.get("arena_next")
+                with st.spinner("AI is reading the arena results…"):
+                    try:
+                        st.session_state[_a_ai_key] = {
+                            "text": _a_ai_client.interpret_arena(
+                                game_name=_a_cfg.name,
+                                leaderboard=_a_res.table.to_dict(orient="records"),
+                                conclusion=_a_res.conclusion,
+                                test_draws=_a_meta["test_draws"],
+                                tickets_per_draw=_a_meta["tickets_per_draw"],
+                                expected_matches=_a_meta["expected_matches"],
+                                crowd=(
+                                    {"cv_auc": _a_crowd.cv_auc, "game_only_auc": _a_crowd.game_only_auc,
+                                     "winner_draws": _a_crowd.winner_draws, "draws": _a_crowd.draws,
+                                     "quintile_winner_rate": _a_crowd.quintile_winner_rate}
+                                    if _a_has_crowd else None
+                                ),
+                                bet_history=load_bet_history(_a_game),
+                                next_tickets=(_a_next["tickets"]
+                                              if _a_next and _a_next["game"] == _a_game else None),
+                            ),
+                            "prompt": _a_ai_client.last_prompt,
+                        }
+                    except Exception as _a_ai_exc:
+                        st.error(f"Azure AI error: {_a_ai_exc}")
+            _a_ai = st.session_state.get(_a_ai_key)
+            if _a_ai:
+                st.markdown("#### AI analysis")
+                st.info(_a_ai["text"])
+                with st.expander("📋 Prompt sent to AI"):
+                    st.code(_a_ai["prompt"], language="text")
+
+    if _a_has_crowd:
+        st.markdown("---")
+        st.subheader("👥 Crowd model — which combinations other players hold")
+        _c1, _c2, _c3 = st.columns(3)
+        _c1.metric("Cross-validated AUC", f"{_a_crowd.cv_auc:.3f}",
+                   delta=f"{_a_crowd.cv_auc - _a_crowd.game_only_auc:+.3f} vs game-only")
+        _c2.metric("Draws with a jackpot winner", f"{_a_crowd.winner_draws:,}")
+        _c3.metric("Draws used", f"{_a_crowd.draws:,}")
+        st.caption(
+            "Winner rate by predicted-crowding quintile (least to most crowded): "
+            + " · ".join(f"{r:.1%}" for r in _a_crowd.quintile_winner_rate)
+            + ". Calendar-range numbers (1-31) are the strongest crowding signal."
+        )
+
+    st.markdown("---")
+    st.subheader("🎟️ Tickets for the next draw")
+    _n1, _n2 = st.columns(2)
+    with _n1:
+        _n_strategy = st.selectbox(
+            "Strategy", _a_options, format_func=lambda k: _ARENA_LABELS[k],
+            index=_a_options.index("ml_crowd") if "ml_crowd" in _a_options else 0,
+            key="arena_next_strategy",
+        )
+    with _n2:
+        _n_count = st.slider("Tickets", 1, 20, 5, key="arena_next_count")
+    if st.button("Generate tickets", key="arena_next_go"):
+        _n_seed = secrets.randbelow(2**31)
+        try:
+            st.session_state["arena_next"] = {
+                "game": _a_game, "draw_time": _a_dt, "strategy": _n_strategy, "seed": _n_seed,
+                "tickets": _arena_next(_a_df, _a_cfg, _n_strategy, n=_n_count,
+                                       draw_time=_a_dt, crowd=_a_crowd, seed=_n_seed),
+            }
+        except Exception as _n_exc:
+            st.error(f"Could not generate tickets: {_n_exc}")
+    _n_ai = AzureAIClient()
+    if _a_has_crowd and _n_ai.is_configured():
+        if st.button("🤖 Let AI pick the tickets", key="arena_ai_pick"):
+            with st.spinner("Building a shortlist with ML and the crowd model, then asking the AI…"):
+                try:
+                    _n_seed = secrets.randbelow(2**31)
+                    _menu = _arena_shortlist(_a_df, _a_cfg, _a_crowd, draw_time=_a_dt, seed=_n_seed)
+                    _pick = _n_ai.select_tickets(
+                        game_name=_a_cfg.name, candidates=_menu["candidates"],
+                        number_context=_menu["number_context"], n=_n_count,
+                        max_overlap=_menu["max_overlap"], bet_history=load_bet_history(_a_game),
+                    )
+                    st.session_state["arena_next"] = {
+                        "game": _a_game, "draw_time": _a_dt, "strategy": "ai_curated",
+                        "seed": _n_seed, "tickets": _pick["tickets"], "reasoning": _pick["reasoning"],
+                        "ai_picked": _pick["ai_picked"], "filled": _pick["filled"],
+                        "shortlist": len(_menu["candidates"]), "prompt": _n_ai.last_prompt,
+                    }
+                except Exception as _pick_exc:
+                    st.error(f"Azure AI error: {_pick_exc}")
+    _n_state = st.session_state.get("arena_next")
+    if _n_state and _n_state["game"] == _a_game:
+        if _n_state.get("strategy") == "ai_curated":
+            st.success(
+                f"AI chose {_n_state['ai_picked']} of {len(_n_state['tickets'])} tickets from a "
+                f"{_n_state['shortlist']}-ticket shortlist built by the ML and crowd models"
+                + (f"; {_n_state['filled']} filled locally in shortlist order." if _n_state["filled"] else ".")
+            )
+            if _n_state["reasoning"]:
+                st.info(_n_state["reasoning"])
+        _n_rows = []
+        for _t in _n_state["tickets"]:
+            _row = {"ticket": " - ".join(f"{v:02d}" for v in _t)}
+            if _a_has_crowd:
+                _arr = np.array([_t])
+                _row["crowd index (1.0 = average)"] = float(_a_crowd.crowd_index(_arr, _a_game)[0])
+                _row["jackpot share kept if won"] = float(_a_crowd.share_factor(_arr, _a_game)[0])
+            _n_rows.append(_row)
+        st.dataframe(pd.DataFrame(_n_rows), hide_index=True, use_container_width=True)
+        st.caption(f"Sampling seed {_n_state.get('seed')}: every click draws a fresh set from the "
+                   "strategy's weights; the same seed reproduces the same tickets.")
+        if _n_state.get("prompt"):
+            with st.expander("📋 Prompt sent to AI"):
+                st.code(_n_state["prompt"], language="text")
+        _n_bet_date = st.date_input(
+            "Draw date", value=_dt_arena.date.today() + _dt_arena.timedelta(days=1),
+            min_value=_dt_arena.date.today(), key="arena_bet_date",
+        )
+        if st.button("🎯 Save these tickets as bets", key="arena_save"):
+            try:
+                _conn_ar = get_connection()
+                for _t in _n_state["tickets"]:
+                    _conn_ar.execute(
+                        """INSERT INTO saved_combinations
+                           (id, saved_at, game, draw_time, combination, reasoning,
+                            label, source, bet_date, status, ml_run_id)
+                           VALUES (nextval('saved_combinations_seq'), NOW(),
+                                   ?, ?, ?, ?, ?, 'bet', ?, 'pending', NULL)""",
+                        [_a_game, _n_state["draw_time"] if len(_a_cfg.draw_times) > 1 else None,
+                         "-".join(f"{v:02d}" for v in _t),
+                         f"Strategy Arena: {_ARENA_LABELS.get(_n_state['strategy'], 'AI-curated (ML + crowd shortlist)')}",
+                         f"arena_{_n_state['strategy']}", _n_bet_date],
+                    )
+                _conn_ar.close()
+                st.toast(f"Saved {len(_n_state['tickets'])} bets", icon="🎯")
+            except Exception as _sv_exc:
+                st.error(f"Save failed: {_sv_exc}")
 
 
 # ===========================================================================

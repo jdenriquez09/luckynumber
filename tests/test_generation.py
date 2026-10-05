@@ -162,6 +162,7 @@ def _generation(ordered=False, fallback=False):
         },
         "feature_weights": {} if fallback else {
             "frequency_last10": 0.31, "frequency_last30": -0.22, "frequency_all": 0.07,
+            "gap_normalized": 0.15, "trend": -0.08, "recency_weight": 0.12,
         },
         "reason": "Need at least 100 usable draws; found 40." if fallback else "Untuned logistic scoring.",
         "training_draws": 0 if fallback else 70,
@@ -186,7 +187,7 @@ def test_ai_supplied_ml_evidence_reaches_prompt_and_cannot_replace_ticket(monkey
     result = client.interpret_lotto_stats(
         "Example", [dict(_slot(), generation=generation)], "ok", "gaps", 3,
         latest_draw={"date": "LEGACY_SENTINEL"},
-        trend_summary={"heating_up": ["LEGACY_SENTINEL"]},
+        trend_summary={"heating_up": [11, 22, 33], "cooling_down": [44, 55]},
         ml_scores={999: 0.99}, shap_summary={999: "LEGACY_SENTINEL"},
         ml_top_combinations=[[999]], feature_importance={"LEGACY_SENTINEL": 9.0},
         pagerank_tiers={"LEGACY_SENTINEL": [999]},
@@ -209,6 +210,11 @@ def test_ai_supplied_ml_evidence_reaches_prompt_and_cannot_replace_ticket(monkey
     assert "does not prove an edge" in prompt
     assert "explain why the model weighted the chosen numbers" in prompt
     assert "RNG still chooses a score-weighted sample, not guaranteed highest-ranked numbers" in prompt
+    # trend_summary is used (not ignored); other legacy params are still ignored
+    assert "trending hotter" in prompt
+    assert "[11, 22, 33]" in prompt
+    assert "trending cooler" in prompt
+    assert "[44, 55]" in prompt
     assert "LEGACY_SENTINEL" not in prompt
     assert "Any supplied combination was generated locally by uniform" not in prompt
     call = sdk.chat.completions.create.call_args.kwargs

@@ -4,6 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
+import pandas as pd
 from api.db import get_connection
 from src.lotto.games import GAMES
 import src.lotto.analysis as an
@@ -172,11 +173,17 @@ def get_ai_summary(game_id: str, body: AISummaryRequest = AISummaryRequest()) ->
             df, game_cfg, method=body.method, n=body.n_suggestions,
             window=body.window, draw_time=dt,
         )
+        # Add heat map summary for unordered games
+        heat_summary_text = ""
+        if not game_cfg.ordered and not heat.empty and "heat_score" in heat.columns:
+            heat_summary_text = pred.heat_map_summary(heat)
         slots_data.append({
             "label": _TIME_LABELS.get(dt, dt),
             "heat_map_rows": heat_map_rows,
             "total_draws": min(len(slot_df), body.window) if game_cfg.ordered and body.window is not None else len(slot_df),
             "generation": generation,
+            "heat_summary": heat_summary_text,
+            "_heat_df": heat if not game_cfg.ordered else pd.DataFrame(),
         })
 
     if not slots_data:
@@ -189,6 +196,19 @@ def get_ai_summary(game_id: str, body: AISummaryRequest = AISummaryRequest()) ->
         chi_result = an.freq_chi_square(df, game_cfg).conclusion
         gap_result = an.gap_analysis(df, game_cfg).conclusion
 
+    # Compute trend summary from the last computed heat map (unordered games only)
+    _trend_summary = None
+    if not game_cfg.ordered and slots_data:
+        _last_heat_summary = slots_data[-1].get("_heat_df")
+        if _last_heat_summary is not None and not _last_heat_summary.empty and "heat_score" in _last_heat_summary.columns:
+            _trend_summary = {
+                "heating_up": _last_heat_summary.nlargest(5, "heat_score")["number"].tolist(),
+                "cooling_down": _last_heat_summary.nsmallest(5, "heat_score")["number"].tolist(),
+            }
+    # Remove internal _heat_df from slot dicts before passing to AI
+    for _sd in slots_data:
+        _sd.pop("_heat_df", None)
+
     try:
         results = ai.interpret_lotto_stats(
             game_name=game_cfg.name,
@@ -196,6 +216,7 @@ def get_ai_summary(game_id: str, body: AISummaryRequest = AISummaryRequest()) ->
             chi_sq_result=chi_result,
             gap_result=gap_result,
             picks=game_cfg.picks,
+            trend_summary=_trend_summary,
         )
     except Exception as exc:
         raise HTTPException(500, str(exc))

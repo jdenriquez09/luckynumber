@@ -267,6 +267,90 @@ def compare_with_actual(game: "str | None" = None) -> int:
         conn.close()
 
 
+def _scored_bets(game: str, limit: int | None = None) -> "list[tuple]":
+    conn = get_connection()
+    try:
+        query = """
+            SELECT bet_date, draw_time, combination, actual_draw, match_count
+            FROM saved_combinations
+            WHERE game = ? AND actual_draw IS NOT NULL
+            ORDER BY bet_date DESC, id DESC
+        """
+        params: list = [game]
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+
+def _parse_combo(text: str) -> "list[int]":
+    return [int(p) for p in str(text).split("-") if p.strip().isdigit()]
+
+
+def load_bet_history(game: str, n: int = 8) -> "list[dict]":
+    """Most recent saved bets already scored against the actual draw."""
+    import json
+    result = []
+    for bet_date, draw_time, combination, actual_raw, match_count in _scored_bets(game, n):
+        played = _parse_combo(combination)
+        actual = json.loads(actual_raw) if actual_raw else []
+        misses = [min(abs(a - p) for a in actual) for p in played
+                  if actual and p not in actual]
+        result.append({
+            "run_date": str(bet_date), "draw_time": draw_time,
+            "ai_combination": played, "actual_draw": actual,
+            "match_count": int(match_count or 0),
+            "total_distance": int(sum(misses)),
+        })
+    return result
+
+
+def bet_number_feedback(
+    game: str, min_appearances: int = 30, shrink: float = 10.0, bound: float = 0.25,
+) -> "dict[int, float]":
+    """Per-number sampling multipliers learned from scored bets.
+
+    Each number's hit rate across past bets is shrunk toward the overall bet
+    hit rate and turned into a multiplier within [1-bound, 1+bound]. Returns an
+    empty dict until the history holds min_appearances scored number slots.
+    """
+    import json
+    appearances: dict[int, int] = {}
+    hits: dict[int, int] = {}
+    for _, _, combination, actual_raw, _ in _scored_bets(game):
+        actual = set(json.loads(actual_raw)) if actual_raw else set()
+        if not actual:
+            continue
+        for number in _parse_combo(combination):
+            appearances[number] = appearances.get(number, 0) + 1
+            hits[number] = hits.get(number, 0) + (number in actual)
+    total = sum(appearances.values())
+    if total < min_appearances or not sum(hits.values()):
+        return {}
+    base = sum(hits.values()) / total
+    return {
+        number: float(min(1 + bound, max(1 - bound,
+                          (hits[number] + shrink * base) / (appearances[number] + shrink) / base)))
+        for number in appearances
+    }
+
+
+def latest_ml_run(game: str) -> "dict | None":
+    """Newest stored AI run (with its prompt) for a game."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """SELECT id, run_at, ai_prompt_text FROM ml_prediction_runs
+               WHERE game = ? AND ai_prompt_text IS NOT NULL
+               ORDER BY run_at DESC, id DESC LIMIT 1""", [game],
+        ).fetchone()
+    finally:
+        conn.close()
+    return {"id": row[0], "run_at": str(row[1]), "prompt": row[2]} if row else None
+
+
 def load_prior_ml_runs(
     game: str,
     draw_time: "str | None" = None,

@@ -160,17 +160,25 @@ def test_features_ignore_current_and_future_outcomes(game):
     np.testing.assert_array_equal(prefix.next_X, first.X[70])
 
 
-def test_three_smoothed_features_and_position_one_hot():
+def test_smoothed_features_gap_trend_recency_and_position_one_hot():
     game = replace(GAMES["3d"], picks=2, pool=2)
     draws = _draws(game, 40)
     draws[["n1", "n2"]] = [2, 0]
     snapshots = ml._build_snapshots(ml._prepare_draws(draws, game), game)
-    assert snapshots.X.shape == (10, 6, 5)
+    assert snapshots.X.shape == (10, 6, 8)  # 6 base features + 2 position indicators
     np.testing.assert_array_equal(snapshots.y[0], [0, 0, 1, 1, 0, 0])
+    # First 3 features: smoothed frequencies (unchanged)
     np.testing.assert_allclose(snapshots.X[0, 2, :3], [(10 + 1 / 3) / 11, (30 + 1 / 3) / 31, (30 + 1 / 3) / 31])
     np.testing.assert_allclose(snapshots.X[0, 0, :3], [(1 / 3) / 11, (1 / 3) / 31, (1 / 3) / 31])
-    np.testing.assert_array_equal(snapshots.X[0, :, 3:], [[1, 0]] * 3 + [[0, 1]] * 3)
-    assert len(snapshots.feature_names) == 5
+    # Features 3-5: gap_normalized, trend, recency_weight — must be finite
+    assert np.isfinite(snapshots.X[0, :, 3:6]).all()
+    # Gap normalised is in [0, 1] (capped at 3.0/3.0)
+    assert (snapshots.X[:, :, 3] >= 0).all() and (snapshots.X[:, :, 3] <= 1).all()
+    # Recency is in (0, 1]
+    assert (snapshots.X[:, :, 5] > 0).all() and (snapshots.X[:, :, 5] <= 1).all()
+    # Position one-hot shifted to columns 6-7
+    np.testing.assert_array_equal(snapshots.X[0, :, 6:], [[1, 0]] * 3 + [[0, 1]] * 3)
+    assert len(snapshots.feature_names) == 8
 
 
 def test_unordered_frequencies_use_inclusion_not_flattened_digit_frequency():
@@ -178,8 +186,10 @@ def test_unordered_frequencies_use_inclusion_not_flattened_digit_frequency():
     draws = _draws(game, 40)
     draws[["n1", "n2"]] = [1, 4]
     snapshots = ml._build_snapshots(ml._prepare_draws(draws, game), game)
-    assert snapshots.X.shape == (10, 4, 3)
-    np.testing.assert_allclose(snapshots.X[0, 0], [10.5 / 11, 30.5 / 31, 30.5 / 31])
+    assert snapshots.X.shape == (10, 4, 6)  # 6 base features, no position indicators
+    np.testing.assert_allclose(snapshots.X[0, 0, :3], [10.5 / 11, 30.5 / 31, 30.5 / 31])
+    # Features 3-5: gap, trend, recency — finite
+    assert np.isfinite(snapshots.X[0, :, 3:6]).all()
     np.testing.assert_array_equal(snapshots.y[0], [1, 0, 0, 1])
 
 
@@ -201,16 +211,16 @@ def test_chronological_groups_frozen_scaler_and_separate_production_fit(monkeypa
     train_X, train_y, evaluation_model = calls[0]
     full_X, full_y, production_model = calls[1]
     assert evaluation_model is not production_model
-    assert train_X.shape == (96, 30, 6)
+    assert train_X.shape == (96, 30, 9)  # 6 base features + 3 position indicators
     np.testing.assert_array_equal(train_X, snapshots.X[:96])
     np.testing.assert_array_equal(train_y, snapshots.y[:96])
     np.testing.assert_array_equal(full_X, snapshots.X)
     np.testing.assert_array_equal(full_y, snapshots.y)
     scaler = evaluation_model.named_steps["scaler"]
     assert scaler.n_samples_seen_ == 96 * 30
-    np.testing.assert_allclose(scaler.mean_, train_X.reshape(-1, 6).mean(axis=0))
+    np.testing.assert_allclose(scaler.mean_, train_X.reshape(-1, 9).mean(axis=0))
     test_X, test_y = snapshots.X[96:], snapshots.y[96:]
-    prediction = evaluation_model.predict_proba(test_X.reshape(-1, 6))[:, 1].reshape(test_y.shape)
+    prediction = evaluation_model.predict_proba(test_X.reshape(-1, 9))[:, 1].reshape(test_y.shape)
     errors = ((prediction - test_y) ** 2).mean(axis=1)
     baseline_errors = ((0.1 - test_y) ** 2).mean(axis=1)
     evaluation = result["evaluation"]

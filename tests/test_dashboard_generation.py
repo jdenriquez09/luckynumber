@@ -110,7 +110,18 @@ def dashboard(monkeypatch):
     monkeypatch.setattr(openai, "AzureOpenAI", blocked)
     for name in ("scrape_pcso_gov", "scrape_pick6", "fetch_page", "_fetch_pcso_gov_chunk"):
         monkeypatch.setattr(scrape, name, blocked)
-    monkeypatch.setattr(db, "compare_with_actual", blocked)
+    stubs = SimpleNamespace(
+        compare=Mock(return_value=0),
+        feedback=Mock(return_value={}),
+        history=Mock(return_value=[]),
+        save_run=Mock(side_effect=lambda **kwargs: 100 + stubs.save_run.call_count),
+        latest_run=Mock(return_value=None),
+    )
+    monkeypatch.setattr(db, "compare_with_actual", stubs.compare)
+    monkeypatch.setattr(db, "bet_number_feedback", stubs.feedback)
+    monkeypatch.setattr(db, "load_bet_history", stubs.history)
+    monkeypatch.setattr(db, "save_ml_run", stubs.save_run)
+    monkeypatch.setattr(db, "latest_ml_run", stubs.latest_run)
     for name, value in {
         "AZURE_OPENAI_ENDPOINT": "https://offline.invalid",
         "AZURE_OPENAI_API_KEY": "offline-test-only",
@@ -167,7 +178,8 @@ def dashboard(monkeypatch):
         # Required before the FIRST run, not after startup has already executed.
         app.session_state["_auto_updated"] = True
         return SimpleNamespace(app=app, game=game, draws=draws, loader=loader,
-                               sdk=sdk, client_factory=client_factory, labels=labels)
+                               sdk=sdk, client_factory=client_factory, labels=labels,
+                               stubs=stubs)
 
     yield start
     st.cache_data.clear()
@@ -297,3 +309,59 @@ def test_probability_uniform_bypasses_generator_and_trainer(dashboard, monkeypat
     assert "Selected number model scores:" not in prompt
     assert "do not fabricate ML explanations" in prompt
     forbidden.assert_not_called()
+
+def test_ai_click_scores_bets_stores_runs_and_sends_history(dashboard):
+    run = dashboard("655")
+    history = [{"run_date": "2026-01-05", "ai_combination": [1, 2, 3, 4, 5, 6],
+                "actual_draw": [1, 2, 9, 10, 11, 12], "match_count": 2, "total_distance": 9}]
+    run.stubs.history.return_value = history
+    _assert_clean(run.app.run())
+    prompt = _assert_ai_click(run)
+    run.stubs.compare.assert_called_once_with("655")
+    run.stubs.history.assert_called_with("655")
+    assert "played [1, 2, 3, 4, 5, 6], drawn [1, 2, 9, 10, 11, 12], matches 2" in prompt
+    assert run.stubs.save_run.call_count == len(run.labels)
+    for call, label, ticket in zip(run.stubs.save_run.call_args_list, run.labels,
+                                   [s["generation"]["combinations"][0]
+                                    for s in run.app.session_state["_test_slots"]]):
+        assert call.kwargs["game"] == "655"
+        assert call.kwargs["ai_prompt_text"] == prompt
+        assert call.kwargs["ai_combination"] == ticket
+        assert call.kwargs["draw_time"] == (label if len(run.labels) > 1 else None)
+    run_ids = [v for k, v in run.app.session_state.filtered_state.items() if k.endswith("_runids")]
+    assert len(run_ids) == 1 and set(run_ids[0]) == set(run.labels)
+
+
+def test_new_bet_feedback_rebuilds_tickets_then_runs_ai_once(dashboard):
+    run = dashboard("655")
+    app = run.app.run()
+    _assert_clean(app)
+    assert all("bet_feedback_numbers" not in g for g in app.session_state["_test_generation"].values())
+    run.stubs.feedback.return_value = {number: 1.25 for number in range(1, 20)}
+    app.button(key="regen_ai").click().run()
+    _assert_clean(app)
+    generations = app.session_state["_test_generation"]
+    assert all(g["bet_feedback_numbers"] == 19 for g in generations.values())
+    run.sdk.chat.completions.create.assert_called_once()
+    prompt = run.sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert "rescaled (x0.75 to x1.25) for 19 numbers" in prompt
+    assert run.stubs.save_run.call_count == len(run.labels)
+    shown = [list(map(int, re.findall(r"`(\d+)`", e.value)))
+             for e in app.markdown if e.value.startswith("**#1**")]
+    assert shown == [g["combinations"][0] for g in generations.values()]
+    # Unchanged feedback on the next click must not trigger another rebuild.
+    app.button(key="regen_ai").click().run()
+    _assert_clean(app)
+    assert run.sdk.chat.completions.create.call_count == 2
+
+
+def test_stored_prompt_is_restored_without_session_state(dashboard):
+    run = dashboard("655")
+    run.stubs.latest_run.return_value = {
+        "id": 7, "run_at": "2026-10-04 12:30:00", "prompt": "STORED PROMPT TEXT",
+    }
+    app = run.app.run()
+    _assert_clean(app)
+    assert any(element.value == "STORED PROMPT TEXT" for element in app.code)
+    assert any("Restored from the stored run of 2026-10-04 12:30" in c.value for c in app.caption)
+    run.client_factory.assert_not_called()
