@@ -365,3 +365,64 @@ def test_stored_prompt_is_restored_without_session_state(dashboard):
     assert any(element.value == "STORED PROMPT TEXT" for element in app.code)
     assert any("Restored from the stored run of 2026-10-04 12:30" in c.value for c in app.caption)
     run.client_factory.assert_not_called()
+
+
+@pytest.mark.parametrize("game_id", ["655", "3d"])
+def test_probability_hybrid_renders_halves_and_explains_both_in_the_ai_prompt(dashboard, game_id):
+    run = dashboard(game_id)
+    run.app.session_state["prob_generation_mode"] = "Hybrid: ML + Lucky numbers"
+    run.app.session_state[f"lucky_date_{game_id}"] = date(2026, 10, 9)
+    app = run.app.run()
+    _assert_clean(app)
+    generations = app.session_state["_test_generation"]
+    assert list(generations) == run.labels
+    rows = [e.value for e in app.markdown if e.value.startswith("**#") and "🧧" in e.value]
+    assert len(rows) == 5 * len(run.labels)
+    for result in generations.values():
+        assert result["method"] == "hybrid_ml_lucky" and result["draw_date"] == "2026-10-09"
+        assert result["ml_count"] == run.game.picks // 2
+        assert result["lucky"]["profile"]["day_pillar"] == "Bing-Chen"
+    first = generations[run.labels[0]]["tickets"][0]
+    assert f"`{first['ml'][0]:02d}`" in rows[0] and f"`{first['lucky'][0]:02d}`" in rows[0]
+    assert any("Day pillar" in e.value and "Bing-Chen" in e.value for e in app.markdown)
+    assert sum("Evaluation status: evaluated" in c.value for c in app.caption) == len(run.labels)
+    run.client_factory.assert_not_called()  # AI stays opt-in
+
+    app.button(key="regen_ai").click().run()
+    _assert_clean(app)
+    run.sdk.chat.completions.create.assert_called_once()
+    prompt = run.sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert prompt.count("Generator method: hybrid_ml_lucky") == len(run.labels)
+    assert "Ticket structure:" in prompt and "Lucky half evidence" in prompt
+    assert "Lucky draw-date profile:" in prompt and "'ML half'" in prompt
+    for label, result in zip(run.labels, generations.values()):
+        block = prompt.split(f"SLOT: {label}" + chr(10), 1)[1].split(chr(10) + "SLOT:", 1)[0]
+        ticket = result["tickets"][0]
+        assert f"Exact preselected combination: {ticket['numbers']}" in block
+        assert f"from the ML half {ticket['ml']}" in block and f"lucky half {ticket['lucky']}" in block
+    headings = [e.value for e in app.success if "Hybrid (ML + Lucky) Combination" in e.value]
+    assert len(headings) == len(run.labels)
+    # One way to save: the 🎯 on each ticket. The AI card has no second save button.
+    assert not [b for b in app.button if b.key.startswith("save_ai_")]
+    assert len([b for b in app.button if b.key.startswith("save_hyb_")]) == 5 * len(run.labels)
+
+
+def test_probability_hybrid_asks_ai_for_lucky_numbers_and_feeds_the_tickets(dashboard):
+    run = dashboard("655")
+    suggested = {5: "Earth day", 10: "Ten is complete", 15: "Half of thirty"}
+    run.sdk.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason="stop", message=SimpleNamespace(content=json.dumps(
+            {"numbers": [{"number": n, "reason": why} for n, why in suggested.items()]})))])
+    run.app.session_state["prob_generation_mode"] = "Hybrid: ML + Lucky numbers"
+    run.app.session_state["lucky_date_655"] = date(2026, 10, 9)
+    app = run.app.run()
+    _assert_clean(app)
+    run.sdk.chat.completions.create.assert_not_called()
+    app.button(key="ai_lucky_btn_655").click().run()
+    _assert_clean(app)
+    run.sdk.chat.completions.create.assert_called_once()
+    assert "Bing-Chen" in run.sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert any("AI lucky numbers" in c.value for c in app.caption)
+    lucky = next(iter(app.session_state["_test_generation"].values()))["lucky"]
+    assert sorted(lucky["personal"]["ai_numbers"]) == [5, 10, 15]
+    assert lucky["reasons"]["10"][-1] == "AI suggestion: Ten is complete"

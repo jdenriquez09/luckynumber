@@ -78,13 +78,26 @@ def load_draws(game_id: str) -> pd.DataFrame:
 @st.cache_data(max_entries=32, show_spinner=False)
 def _prob_generation(_df: pd.DataFrame, dataset_hash: str, game_id: str,
                      window: int | None, draw_time: str, n: int,
-                     mode: str, model_version: str, feedback_json: str = "") -> dict:
+                     mode: str, model_version: str, feedback_json: str = "",
+                     hybrid_json: str = "") -> dict:
     """Cache per-slot tickets/metrics; explicit snapshot and version key _df."""
+    import datetime as _datetime
     import json as _json
     from src.lotto.lean_ml import generate_ml_combinations, _prepare_draws
+    from src.lotto.lucky import HYBRID_MODE, hybrid_generation
     from src.lotto.predict import random_combinations
 
     cfg = GAMES[game_id]
+    if mode == HYBRID_MODE:
+        options = _json.loads(hybrid_json)
+        feedback = {int(k): float(v) for k, v in _json.loads(feedback_json).items()} if feedback_json else None
+        return hybrid_generation(
+            _df, cfg, n=n, window=window, draw_time=draw_time, seed=42, bet_feedback=feedback,
+            draw_date=_datetime.date.fromisoformat(options["draw_date"]),
+            ml_count=options["ml_count"], extra_numbers=options["extra_numbers"],
+            ai_numbers={int(k): v for k, v in options.get("ai_numbers", {}).items()},
+            birthdate=(_datetime.date.fromisoformat(options["birthdate"]) if options["birthdate"] else None),
+        )
     if mode == "ML-assisted":
         feedback = {int(k): float(v) for k, v in _json.loads(feedback_json).items()} if feedback_json else None
         return generate_ml_combinations(
@@ -1388,6 +1401,7 @@ elif page == "Probability & AI":
         number_heat_map, DISCLAIMER
     )
     import src.lotto.lean_ml as _lean_ml
+    import src.lotto.lucky as _lucky
     from src.lotto.azure_ai import AzureAIClient
     import src.lotto.analysis as _an
 
@@ -1618,7 +1632,7 @@ elif page == "Probability & AI":
     # --- Local combinations: learned scoring or explicit uniform sampling ---
     st.subheader("Combinations")
     generation_mode = st.selectbox(
-        "Selection method", ["ML-assisted", "Uniform random"],
+        "Selection method", ["ML-assisted", "Uniform random", _lucky.HYBRID_MODE],
         index=0, key="prob_generation_mode",
     )
     st.caption(
@@ -1626,9 +1640,70 @@ elif page == "Probability & AI":
         "At least 100 valid draws per slot are required; 30/90-draw windows fall back to uniform random. "
         "Scores are not ticket odds and do not establish a winning advantage. **Not a prediction.**"
         if generation_mode == "ML-assisted" else
+        "Half of every ticket comes from the ML scores, the other half from lucky numbers of the draw "
+        "date: Chinese day pillar and feng shui, numerology, your birth date and any numbers you add. "
+        "Ticket #1 uses the strongest of each; later tickets sample. The Strategy Arena scores this "
+        "hybrid against random play. **Not a prediction.**"
+        if generation_mode == _lucky.HYBRID_MODE else
         "Uniform random sampling — no learned weights. Every valid combination has the same "
         "chance in a fair draw. **Not a prediction.**"
     )
+
+    import datetime as _dt_lucky
+    from src.lotto.lucky import default_ml_count, next_draw_date, parse_extra_numbers
+    _hybrid_json = ""
+    if generation_mode == _lucky.HYBRID_MODE:
+        _hc1, _hc2, _hc3 = st.columns([1, 1, 1])
+        with _hc1:
+            _lucky_date = st.date_input(
+                "Draw date for lucky numbers", value=next_draw_date(game_cfg),
+                format="YYYY-MM-DD", key=f"lucky_date_{game_id}",
+            )
+        with _hc2:
+            _lucky_birth = st.date_input(
+                "Your birth date (optional)", value=None, min_value=_dt_lucky.date(1900, 1, 1),
+                max_value=_dt_lucky.date.today(), format="YYYY-MM-DD", key="lucky_birthdate",
+            )
+        with _hc3:
+            _ml_count = st.slider(
+                "Numbers taken from ML", 0, game_cfg.picks, default_ml_count(game_cfg),
+                key=f"lucky_ml_count_{game_id}",
+                help=f"The other {game_cfg.picks} − N numbers come from lucky-number sources.",
+            )
+        _lucky_extra_text = st.text_input(
+            "Your own lucky numbers (optional)", key=f"lucky_extra_{game_id}",
+            placeholder="e.g. 7, 23, 41 — from a horoscope site, fortune cookie, dream, plate number…",
+        )
+        _ai_lucky_key = f"ai_lucky_{game_id}_{_lucky_date.isoformat()}"
+        _ai_lucky_client = AzureAIClient()
+        if _ai_lucky_client.is_configured():
+            _ab1, _ab2 = st.columns([2, 1])
+            if _ab1.button("🤖 Ask AI for lucky numbers of this date", key=f"ai_lucky_btn_{game_id}"):
+                try:
+                    with st.spinner("Asking the AI for lucky numbers…"):
+                        st.session_state[_ai_lucky_key] = _lucky.ask_ai_lucky_numbers(
+                            _ai_lucky_client, game_cfg, _lucky_date, _lucky_birth)
+                except Exception as _ai_lk_exc:
+                    st.error(f"Azure AI error: {_ai_lk_exc}")
+            if _ab2.button("Clear AI numbers", key=f"ai_lucky_clear_{game_id}"):
+                st.session_state.pop(_ai_lucky_key, None)
+        _ai_lucky_numbers = st.session_state.get(_ai_lucky_key, {})
+        if _ai_lucky_numbers:
+            st.caption(
+                "🤖 AI lucky numbers (the AI has no live web access; it answers from training knowledge "
+                "using the calendar facts computed here, and they count as one more lucky source): "
+                + ", ".join(f"**{n:02d}**" for n in _ai_lucky_numbers)
+            )
+            with st.expander("Why the AI suggested them"):
+                st.dataframe(pd.DataFrame(
+                    [{"number": n, "reason": why} for n, why in _ai_lucky_numbers.items()]),
+                    hide_index=True, use_container_width=True)
+        _hybrid_json = json.dumps({
+            "draw_date": _lucky_date.isoformat(), "ml_count": int(_ml_count),
+            "birthdate": _lucky_birth.isoformat() if _lucky_birth else None,
+            "extra_numbers": parse_extra_numbers(_lucky_extra_text, game_cfg),
+            "ai_numbers": {str(n): why for n, why in _ai_lucky_numbers.items()},
+        }, sort_keys=True)
 
     col_sl, col_lbl = st.columns([3, 5])
     with col_sl:
@@ -1649,7 +1724,7 @@ elif page == "Probability & AI":
 
     _ai_combo_key = (
         f"ai_combo_lean_v1_{_LEAN_ML_VERSION}_{game_id}_{window}_{_data_hash}"
-        f"_{generation_mode}_{n_combos}"
+        f"_{generation_mode}_{n_combos}_{_hashlib.sha256(_hybrid_json.encode()).hexdigest()[:8]}"
     )
     # Per-number feedback learned from scored bets; refreshed only when the
     # Generate button is clicked (no database access while rendering).
@@ -1662,16 +1737,81 @@ elif page == "Probability & AI":
         generation_by_label = {
             _TIME_LABELS.get(dt, dt): _prob_generation(
                 df, _data_hash, game_id, window, dt, n_combos,
-                generation_mode, _LEAN_ML_VERSION, _feedback_json,
+                generation_mode,
+                _LEAN_ML_VERSION + _hashlib.sha256(_inspect.getsource(_lucky).encode()).hexdigest()[:16],
+                _feedback_json, _hybrid_json,
             )
             for dt in game_cfg.draw_times
         }
 
-    def _render_generation(result: dict) -> None:
-        for i, combo in enumerate(result["combinations"], 1):
-            st.markdown(f"**#{i}** &nbsp; " + _combo_fmt(combo))
+    def _render_lucky_profile(lucky: dict) -> None:
+        profile = lucky["profile"]
+        with st.expander(f"🧧 Lucky numbers for {profile['date']} ({profile['weekday']})", expanded=True):
+            st.markdown(
+                f"**Day pillar** {profile['day_pillar']} — {profile['day_element']} {profile['day_animal']} day "
+                f"(fed by {profile['day_mother_element']}) · **Year** {profile['year_pillar']} "
+                f"{profile['year_animal']}, flying star **{profile['year_star']}** · "
+                f"**Weekday number** {profile['weekday_number']} · **{profile['sun_sign']}** ruler number "
+                f"{profile['sign_number']} · **Universal day** {profile['universal_day']} · "
+                f"**Moon-age day** ≈ {profile['moon_age_day']}"
+            )
+            if lucky["personal"].get("life_path"):
+                st.caption(f"Life path number from your birth date: {lucky['personal']['life_path']}.")
+            st.dataframe(pd.DataFrame(lucky["top_numbers"]), hide_index=True, use_container_width=True)
+            st.caption(
+                "Lucky scores add up every source that endorses a number; digits containing 4 are "
+                "discounted in the Chinese sources. The moon-age day is an astronomical approximation."
+            )
+
+    def _save_hybrid_bet(ticket: list[int], slot_label: str, draw_date: str) -> None:
+        formatted = "-".join(f"{n:02d}" for n in ticket)
+        try:
+            conn_sv = get_connection()
+            try:
+                conn_sv.execute(
+                    """INSERT INTO saved_combinations
+                       (id, saved_at, game, draw_time, combination, reasoning,
+                        label, source, bet_date, status, ml_run_id)
+                       VALUES (nextval('saved_combinations_seq'), NOW(),
+                               ?, ?, ?, ?, ?, 'bet', ?, 'pending', NULL)""",
+                    [game_cfg.id, slot_label if is_multi_draw else None, formatted,
+                     "Hybrid ticket: ML scores + lucky numbers of the draw date.",
+                     f"{draw_date.replace('-', '')}_{game_cfg.name.replace(' ', '').replace('/', '')}_hybrid",
+                     draw_date],
+                )
+            finally:
+                conn_sv.close()
+            st.toast(f"Bet saved: {formatted}", icon="🎯")
+        except Exception as exc_sv:
+            st.error(f"Save failed: {exc_sv}")
+
+    def _render_hybrid_tickets(result: dict, slot_label: str) -> None:
+        for i, ticket in enumerate(result["tickets"], 1):
+            line, save = st.columns([8, 1])
+            ml_part = " &nbsp;·&nbsp; ".join(f"`{n:02d}`" for n in ticket["ml"])
+            lucky_part = " &nbsp;·&nbsp; ".join(f"`{n:02d}`" for n in ticket["lucky"])
+            line.markdown(
+                f"**#{i}** &nbsp; 🤖 {ml_part} &nbsp;&nbsp;|&nbsp;&nbsp; 🧧 {lucky_part}"
+                f" &nbsp; → &nbsp; {_combo_fmt(ticket['numbers'])}"
+            )
+            if save.button("🎯", key=f"save_hyb_{game_id}_{slot_label}_{i}_{result['draw_date']}",
+                           help="Save this ticket as a bet for the draw date"):
+                _save_hybrid_bet(ticket["numbers"], slot_label, result["draw_date"])
+        st.caption(
+            f"🤖 = {result['ml_count']} numbers from the ML scores · 🧧 = {result['lucky_count']} lucky numbers "
+            f"for {result['draw_date']}. Ticket #1 uses the strongest of each. The metrics below evaluate "
+            "the ML half only."
+        )
+
+    def _render_generation(result: dict, slot_label: str = "") -> None:
+        is_hybrid = result["method"] == "hybrid_ml_lucky"
+        if is_hybrid:
+            _render_hybrid_tickets(result, slot_label)
+        else:
+            for i, combo in enumerate(result["combinations"], 1):
+                st.markdown(f"**#{i}** &nbsp; " + _combo_fmt(combo))
         evaluation = result["evaluation"]
-        if result["method"] == "uniform_fallback":
+        if result["method"] == "uniform_fallback" or result.get("ml_method") == "uniform_fallback":
             st.warning(result["reason"])
         metrics = st.columns(3)
         for column, label, value in zip(
@@ -1714,13 +1854,16 @@ elif page == "Probability & AI":
             if evaluation.get("caution"):
                 st.caption(evaluation["caution"])
 
+    if generation_mode == _lucky.HYBRID_MODE:
+        _render_lucky_profile(next(iter(generation_by_label.values()))["lucky"])
     if is_multi_draw:
         combo_tabs = st.tabs(list(generation_by_label))
-        for tab, result in zip(combo_tabs, generation_by_label.values()):
+        for tab, (slot_label, result) in zip(combo_tabs, generation_by_label.items()):
             with tab:
-                _render_generation(result)
+                _render_generation(result, slot_label)
     else:
-        _render_generation(next(iter(generation_by_label.values())))
+        _slot_label, _slot_result = next(iter(generation_by_label.items()))
+        _render_generation(_slot_result, _slot_label)
 
     # --- Azure AI Analysis ---
     st.subheader("AI Statistical Interpretation")
@@ -1778,78 +1921,79 @@ elif page == "Probability & AI":
                     st.markdown(f"#### {slot_label}")
                 if res.get("combination"):
                     combo_str = " — ".join(f"**{n:02d}**" for n in res["combination"])
-                    heading = (
-                        "ML-assisted Combination — AI Explanation"
-                        if res.get("generation", {}).get("method") == "logistic_regression"
-                        else "Uniform random Combination — AI Explanation"
-                    )
+                    heading = {
+                        "logistic_regression": "ML-assisted Combination — AI Explanation",
+                        "hybrid_ml_lucky": "Hybrid (ML + Lucky) Combination — AI Explanation",
+                    }.get(res.get("generation", {}).get("method"),
+                          "Uniform random Combination — AI Explanation")
                     st.success(
                         f"### {heading}\n\n"
                         f"{combo_str}\n\n*{game_cfg.name}*"
                         + (f" · {slot_label}" if is_multi_draw else "")
                     )
-                    # Save as Bet — unique key per slot
-                    _save_key = f"save_ai_{game_cfg.id}_{slot_label}"
-                    _label_key = f"save_label_{game_cfg.id}_{slot_label}"
-                    _bet_date_key = f"save_betdate_{game_cfg.id}_{slot_label}"
-                    import datetime as _dt_mod2
+                    if res.get("generation", {}).get("method") != "hybrid_ml_lucky":  # hybrid tickets save from the 🎯 on each ticket above
+                        # Save as Bet — unique key per slot
+                        _save_key = f"save_ai_{game_cfg.id}_{slot_label}"
+                        _label_key = f"save_label_{game_cfg.id}_{slot_label}"
+                        _bet_date_key = f"save_betdate_{game_cfg.id}_{slot_label}"
+                        import datetime as _dt_mod2
 
-                    # --- Auto-generate label and next draw date ---
-                    _WDAY = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3,
-                             "Fri": 4, "Sat": 5, "Sun": 6}
-                    _REVERSE_TL = {"2:00 PM": "14:00", "5:00 PM": "17:00", "9:00 PM": "21:00"}
-                    _draw_days_idx = {_WDAY[d] for d in game_cfg.draw_days}
-                    _today = _dt_mod2.date.today()
-                    _next_draw = next(
-                        (_today + _dt_mod2.timedelta(days=i)
-                         for i in range(1, 8)
-                         if (_today + _dt_mod2.timedelta(days=i)).weekday() in _draw_days_idx),
-                        _today + _dt_mod2.timedelta(days=1),
-                    )
-                    _game_slug = game_cfg.name.replace(" ", "").replace("/", "")
-                    if is_multi_draw:
-                        _dt_str = _REVERSE_TL.get(slot_label, slot_label).replace(":", "")
-                        _auto_label = f"{_next_draw.strftime('%Y%m%d')}_{_dt_str}_{_game_slug}"
-                    else:
-                        _auto_label = f"{_next_draw.strftime('%Y%m%d')}_{_game_slug}"
+                        # --- Auto-generate label and next draw date ---
+                        _WDAY = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3,
+                                 "Fri": 4, "Sat": 5, "Sun": 6}
+                        _REVERSE_TL = {"2:00 PM": "14:00", "5:00 PM": "17:00", "9:00 PM": "21:00"}
+                        _draw_days_idx = {_WDAY[d] for d in game_cfg.draw_days}
+                        _today = _dt_mod2.date.today()
+                        _next_draw = next(
+                            (_today + _dt_mod2.timedelta(days=i)
+                             for i in range(1, 8)
+                             if (_today + _dt_mod2.timedelta(days=i)).weekday() in _draw_days_idx),
+                            _today + _dt_mod2.timedelta(days=1),
+                        )
+                        _game_slug = game_cfg.name.replace(" ", "").replace("/", "")
+                        if is_multi_draw:
+                            _dt_str = _REVERSE_TL.get(slot_label, slot_label).replace(":", "")
+                            _auto_label = f"{_next_draw.strftime('%Y%m%d')}_{_dt_str}_{_game_slug}"
+                        else:
+                            _auto_label = f"{_next_draw.strftime('%Y%m%d')}_{_game_slug}"
 
-                    _sc1, _sc2 = st.columns([2, 1])
-                    with _sc1:
-                        _label_val = st.text_input(
-                            "Note (optional)",
-                            key=_label_key,
-                            value=_auto_label,
-                            label_visibility="collapsed",
-                        )
-                    with _sc2:
-                        _bet_date_val = st.date_input(
-                            "Draw date",
-                            key=_bet_date_key,
-                            value=_next_draw,
-                            min_value=_today,
-                            format="YYYY-MM-DD",
-                            label_visibility="collapsed",
-                        )
-                    if st.button("🎯 Save as Bet", key=_save_key):
-                        _combo_formatted = "-".join(f"{n:02d}" for n in res["combination"])
-                        _dt_save = slot_label if is_multi_draw else None
-                        try:
-                            _conn_sv = get_connection()
-                            _conn_sv.execute(
-                                """INSERT INTO saved_combinations
-                                   (id, saved_at, game, draw_time, combination, reasoning,
-                                    label, source, bet_date, status, ml_run_id)
-                                   VALUES (nextval('saved_combinations_seq'), NOW(),
-                                           ?, ?, ?, ?, ?, 'bet', ?, 'pending', ?)""",
-                                [game_cfg.id, _dt_save, _combo_formatted,
-                                 res.get("reasoning"), _label_val or None,
-                                 _bet_date_val,
-                                 st.session_state.get(f"{_ai_combo_key}_runids", {}).get(slot_label)],
+                        _sc1, _sc2 = st.columns([2, 1])
+                        with _sc1:
+                            _label_val = st.text_input(
+                                "Note (optional)",
+                                key=_label_key,
+                                value=_auto_label,
+                                label_visibility="collapsed",
                             )
-                            _conn_sv.close()
-                            st.toast(f"Bet saved: {_combo_formatted}", icon="🎯")
-                        except Exception as _sv_exc:
-                            st.error(f"Save failed: {_sv_exc}")
+                        with _sc2:
+                            _bet_date_val = st.date_input(
+                                "Draw date",
+                                key=_bet_date_key,
+                                value=_next_draw,
+                                min_value=_today,
+                                format="YYYY-MM-DD",
+                                label_visibility="collapsed",
+                            )
+                        if st.button("🎯 Save as Bet", key=_save_key):
+                            _combo_formatted = "-".join(f"{n:02d}" for n in res["combination"])
+                            _dt_save = slot_label if is_multi_draw else None
+                            try:
+                                _conn_sv = get_connection()
+                                _conn_sv.execute(
+                                    """INSERT INTO saved_combinations
+                                       (id, saved_at, game, draw_time, combination, reasoning,
+                                        label, source, bet_date, status, ml_run_id)
+                                       VALUES (nextval('saved_combinations_seq'), NOW(),
+                                               ?, ?, ?, ?, ?, 'bet', ?, 'pending', ?)""",
+                                    [game_cfg.id, _dt_save, _combo_formatted,
+                                     res.get("reasoning"), _label_val or None,
+                                     _bet_date_val,
+                                     st.session_state.get(f"{_ai_combo_key}_runids", {}).get(slot_label)],
+                                )
+                                _conn_sv.close()
+                                st.toast(f"Bet saved: {_combo_formatted}", icon="🎯")
+                            except Exception as _sv_exc:
+                                st.error(f"Save failed: {_sv_exc}")
                 if res.get("reasoning"):
                     st.info(res["reasoning"])
                 if res.get("disclaimer"):
@@ -2269,7 +2413,7 @@ elif page == "Strategy Arena":
     from src.lotto.azure_ai import AzureAIClient
     from src.lotto.arena import (
         STRATEGY_LABELS as _ARENA_LABELS, available_strategies as _arena_available,
-        ai_shortlist as _arena_shortlist, next_draw_tickets as _arena_next,
+        next_draw_tickets as _arena_next,
         run_arena as _run_arena,
     )
     from src.lotto.crowd import crowd_games as _crowd_games, fit_crowd_model as _fit_crowd
@@ -2404,77 +2548,167 @@ elif page == "Strategy Arena":
 
     st.markdown("---")
     st.subheader("🎟️ Tickets for the next draw")
-    _n1, _n2 = st.columns(2)
+    import src.lotto.lucky as _lucky_mod
+    from src.lotto.arena import next_draw_hybrid_tickets as _arena_next_hybrid
+    from src.lotto.lucky import (
+        day_profile as _day_profile, default_ml_count as _default_ml_count,
+        next_draw_date as _next_draw_date, parse_extra_numbers as _parse_extra,
+    )
+    _n1, _n2, _n3 = st.columns(3)
     with _n1:
         _n_strategy = st.selectbox(
             "Strategy", _a_options, format_func=lambda k: _ARENA_LABELS[k],
-            index=_a_options.index("ml_crowd") if "ml_crowd" in _a_options else 0,
+            index=_a_options.index("hybrid") if "hybrid" in _a_options else 0,
             key="arena_next_strategy",
         )
     with _n2:
         _n_count = st.slider("Tickets", 1, 20, 5, key="arena_next_count")
+    with _n3:
+        _n_date = st.date_input(
+            "Draw date", value=_next_draw_date(_a_cfg), min_value=_dt_arena.date.today(),
+            format="YYYY-MM-DD", key="arena_bet_date",
+            help="Lucky numbers are scored for this date; saved bets use it too.",
+        )
+    _n_birth, _n_extra, _n_ml_count = None, [], _default_ml_count(_a_cfg)
+    _n_ai_numbers = {}
+    if _n_strategy in ("lucky", "hybrid"):
+        _p = _day_profile(_n_date)
+        st.caption(
+            f"🧧 {_n_date.isoformat()} ({_p['weekday']}): {_p['day_pillar']} {_p['day_element']} "
+            f"{_p['day_animal']} day · {_p['year_pillar']} {_p['year_animal']} year, flying star "
+            f"{_p['year_star']} · {_p['sun_sign']} · universal day {_p['universal_day']} · "
+            f"moon-age day ≈ {_p['moon_age_day']}"
+        )
+        with st.expander("Lucky-number inputs (optional)"):
+            _l1, _l2, _l3 = st.columns(3)
+            with _l1:
+                _n_birth = st.date_input(
+                    "Your birth date", value=None, min_value=_dt_arena.date(1900, 1, 1),
+                    max_value=_dt_arena.date.today(), format="YYYY-MM-DD", key="arena_birthdate",
+                )
+            with _l2:
+                _extra_text = st.text_input(
+                    "Your own lucky numbers", key=f"arena_extra_{_a_game}", placeholder="e.g. 7, 23, 41",
+                )
+                _n_extra = _parse_extra(_extra_text, _a_cfg)
+            _n_ai_key = f"arena_ai_lucky_{_a_game}_{_n_date.isoformat()}"
+            _n_ai_client = AzureAIClient()
+            if _n_ai_client.is_configured():
+                _nb1, _nb2 = st.columns([2, 1])
+                if _nb1.button("🤖 Ask AI for lucky numbers of this date", key="arena_ai_lucky_btn"):
+                    try:
+                        with st.spinner("Asking the AI for lucky numbers…"):
+                            st.session_state[_n_ai_key] = _lucky_mod.ask_ai_lucky_numbers(
+                                _n_ai_client, _a_cfg, _n_date, _n_birth)
+                    except Exception as _n_ai_exc:
+                        st.error(f"Azure AI error: {_n_ai_exc}")
+                if _nb2.button("Clear AI numbers", key="arena_ai_lucky_clear"):
+                    st.session_state.pop(_n_ai_key, None)
+            _n_ai_numbers = st.session_state.get(_n_ai_key, {})
+            if _n_ai_numbers:
+                st.caption(
+                    "🤖 AI lucky numbers (no live web access; answered from training knowledge using the "
+                    "calendar facts computed here): "
+                    + ", ".join(f"**{n:02d}**" for n in _n_ai_numbers) + ". "
+                    + " ".join(f"{n:02d}: {why}" for n, why in _n_ai_numbers.items())
+                )
+            if _n_strategy == "hybrid":
+                with _l3:
+                    _n_ml_count = st.slider(
+                        "Numbers taken from ML", 0, _a_cfg.picks, _default_ml_count(_a_cfg),
+                        key=f"arena_ml_count_{_a_game}",
+                    )
     if st.button("Generate tickets", key="arena_next_go"):
         _n_seed = secrets.randbelow(2**31)
         try:
+            _n_halves = None
+            if _n_strategy == "hybrid":
+                _n_halves = _arena_next_hybrid(
+                    _a_df, _a_cfg, n=_n_count, draw_time=_a_dt, seed=_n_seed, draw_date=_n_date,
+                    ml_count=_n_ml_count, birthdate=_n_birth, extra_numbers=_n_extra,
+                    ai_numbers=_n_ai_numbers,
+                )
+                _n_tickets = [h["numbers"] for h in _n_halves]
+            else:
+                _n_tickets = _arena_next(
+                    _a_df, _a_cfg, _n_strategy, n=_n_count, draw_time=_a_dt, crowd=_a_crowd,
+                    seed=_n_seed, draw_date=_n_date, birthdate=_n_birth, extra_numbers=_n_extra,
+                    ai_numbers=_n_ai_numbers,
+                )
             st.session_state["arena_next"] = {
                 "game": _a_game, "draw_time": _a_dt, "strategy": _n_strategy, "seed": _n_seed,
-                "tickets": _arena_next(_a_df, _a_cfg, _n_strategy, n=_n_count,
-                                       draw_time=_a_dt, crowd=_a_crowd, seed=_n_seed),
+                "draw_date": _n_date, "tickets": _n_tickets, "halves": _n_halves,
+                "birthdate": _n_birth, "extra_numbers": _n_extra, "ai_numbers": _n_ai_numbers,
             }
         except Exception as _n_exc:
             st.error(f"Could not generate tickets: {_n_exc}")
-    _n_ai = AzureAIClient()
-    if _a_has_crowd and _n_ai.is_configured():
-        if st.button("🤖 Let AI pick the tickets", key="arena_ai_pick"):
-            with st.spinner("Building a shortlist with ML and the crowd model, then asking the AI…"):
-                try:
-                    _n_seed = secrets.randbelow(2**31)
-                    _menu = _arena_shortlist(_a_df, _a_cfg, _a_crowd, draw_time=_a_dt, seed=_n_seed)
-                    _pick = _n_ai.select_tickets(
-                        game_name=_a_cfg.name, candidates=_menu["candidates"],
-                        number_context=_menu["number_context"], n=_n_count,
-                        max_overlap=_menu["max_overlap"], bet_history=load_bet_history(_a_game),
-                    )
-                    st.session_state["arena_next"] = {
-                        "game": _a_game, "draw_time": _a_dt, "strategy": "ai_curated",
-                        "seed": _n_seed, "tickets": _pick["tickets"], "reasoning": _pick["reasoning"],
-                        "ai_picked": _pick["ai_picked"], "filled": _pick["filled"],
-                        "shortlist": len(_menu["candidates"]), "prompt": _n_ai.last_prompt,
-                    }
-                except Exception as _pick_exc:
-                    st.error(f"Azure AI error: {_pick_exc}")
     _n_state = st.session_state.get("arena_next")
-    if _n_state and _n_state["game"] == _a_game:
-        if _n_state.get("strategy") == "ai_curated":
-            st.success(
-                f"AI chose {_n_state['ai_picked']} of {len(_n_state['tickets'])} tickets from a "
-                f"{_n_state['shortlist']}-ticket shortlist built by the ML and crowd models"
-                + (f"; {_n_state['filled']} filled locally in shortlist order." if _n_state["filled"] else ".")
-            )
-            if _n_state["reasoning"]:
-                st.info(_n_state["reasoning"])
+    # Tickets made before the draw date was stored (older session) are stale: regenerate.
+    if _n_state and _n_state["game"] == _a_game and "draw_date" in _n_state:
         _n_rows = []
-        for _t in _n_state["tickets"]:
+        for _i, _t in enumerate(_n_state["tickets"]):
             _row = {"ticket": " - ".join(f"{v:02d}" for v in _t)}
+            if _n_state.get("halves"):
+                _half = _n_state["halves"][_i]
+                _row["🤖 ML numbers"] = " - ".join(f"{v:02d}" for v in _half["ml"])
+                _row["🧧 Lucky numbers"] = " - ".join(f"{v:02d}" for v in _half["lucky"])
             if _a_has_crowd:
                 _arr = np.array([_t])
                 _row["crowd index (1.0 = average)"] = float(_a_crowd.crowd_index(_arr, _a_game)[0])
                 _row["jackpot share kept if won"] = float(_a_crowd.share_factor(_arr, _a_game)[0])
             _n_rows.append(_row)
         st.dataframe(pd.DataFrame(_n_rows), hide_index=True, use_container_width=True)
-        st.caption(f"Sampling seed {_n_state.get('seed')}: every click draws a fresh set from the "
-                   "strategy's weights; the same seed reproduces the same tickets.")
-        if _n_state.get("prompt"):
-            with st.expander("📋 Prompt sent to AI"):
-                st.code(_n_state["prompt"], language="text")
-        _n_bet_date = st.date_input(
-            "Draw date", value=_dt_arena.date.today() + _dt_arena.timedelta(days=1),
-            min_value=_dt_arena.date.today(), key="arena_bet_date",
+        st.caption(
+            f"Tickets for the {_n_state['draw_date'].isoformat()} draw. Sampling seed "
+            f"{_n_state.get('seed')}: every click draws a fresh set from the strategy's weights; "
+            "the same seed reproduces the same tickets."
+            + (" 🤖 = numbers from the ML scores, 🧧 = lucky numbers of the draw date; ticket #1 "
+               "uses the strongest of each." if _n_state.get("halves") else "")
         )
+        if _n_state["strategy"] in ("hybrid", "lucky"):
+            from src.lotto.lucky import lucky_scores as _lucky_scores
+            _lk = _lucky_scores(_a_cfg, _n_state["draw_date"], birthdate=_n_state.get("birthdate"),
+                                extra_numbers=_n_state.get("extra_numbers") or (),
+                                ai_numbers=_n_state.get("ai_numbers") or None)
+            _lk_score = dict(zip(_lk.numbers, _lk.scores))
+            _base = (1 if _a_cfg.ordered else _a_cfg.picks) / (_a_cfg.pool - _a_cfg.low_boundary + 1)
+            _why_rows = []
+            for _i, _t in enumerate(_n_state["tickets"], 1):
+                _half = _n_state["halves"][_i - 1] if _n_state.get("halves") else None
+                _ml_pairs = list(zip(_half["ml"], _half["ml_scores"])) if _half else []
+                _lucky_nums = list(_half["lucky"]) if _half else list(_t)
+                for _num, _sc in _ml_pairs:
+                    _why_rows.append({
+                        "ticket": _i, "number": f"{_num:02d}", "from": "🤖 ML",
+                        "why": f"ML score {_sc:.4f} (random baseline {_base:.4f}); "
+                               "learned from draw history, not odds",
+                    })
+                for _num in _lucky_nums:
+                    _why_rows.append({
+                        "ticket": _i, "number": f"{_num:02d}", "from": "🧧 Lucky",
+                        "why": f"lucky score {_lk_score.get(_num, 0.0):.1f}: "
+                               + ("; ".join(_lk.reasons.get(_num, [])) or "no source endorses it"),
+                    })
+            with st.expander("🔎 Where each number comes from", expanded=True):
+                st.dataframe(pd.DataFrame(_why_rows), hide_index=True, use_container_width=True)
+                st.caption(
+                    "🤖 ML numbers are scored by the logistic model from past draws. 🧧 Lucky numbers add "
+                    "up every source that endorses them for the draw date (feng shui day element and "
+                    "animal, auspicious digits, flying star, numerology, birth date, your own numbers); "
+                    "digits containing 4 are discounted. Lucky sources are traditions, not statistics. "
+                    "Ticket #1 takes the top-scoring numbers of each kind, the others are sampled."
+                )
+        if _n_state["draw_date"] != _n_date:
+            st.warning("The draw date changed after these tickets were made. Click Generate tickets "
+                       "again so the lucky numbers match the date you will bet on.")
         if st.button("🎯 Save these tickets as bets", key="arena_save"):
             try:
                 _conn_ar = get_connection()
-                for _t in _n_state["tickets"]:
+                for _i, _t in enumerate(_n_state["tickets"]):
+                    _why = f"Strategy Arena: {_ARENA_LABELS[_n_state['strategy']]}"
+                    if _n_state.get("halves"):
+                        _half = _n_state["halves"][_i]
+                        _why += f" — ML {_half['ml']} + lucky {_half['lucky']} for {_n_state['draw_date']}"
                     _conn_ar.execute(
                         """INSERT INTO saved_combinations
                            (id, saved_at, game, draw_time, combination, reasoning,
@@ -2482,9 +2716,8 @@ elif page == "Strategy Arena":
                            VALUES (nextval('saved_combinations_seq'), NOW(),
                                    ?, ?, ?, ?, ?, 'bet', ?, 'pending', NULL)""",
                         [_a_game, _n_state["draw_time"] if len(_a_cfg.draw_times) > 1 else None,
-                         "-".join(f"{v:02d}" for v in _t),
-                         f"Strategy Arena: {_ARENA_LABELS.get(_n_state['strategy'], 'AI-curated (ML + crowd shortlist)')}",
-                         f"arena_{_n_state['strategy']}", _n_bet_date],
+                         "-".join(f"{v:02d}" for v in _t), _why,
+                         f"arena_{_n_state['strategy']}", _n_state["draw_date"]],
                     )
                 _conn_ar.close()
                 st.toast(f"Saved {len(_n_state['tickets'])} bets", icon="🎯")

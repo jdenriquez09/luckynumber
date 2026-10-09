@@ -24,6 +24,12 @@ try:
 except ImportError:
     pass
 
+# Completion budgets include the reasoning tokens o1/o3 models spend before answering.
+TOKENS_PER_SLOT = 6000
+MAX_COMPLETION_TOKENS = 16000
+ANALYSIS_TOKENS = 8000
+CHART_TOKENS = 2000
+
 # Instructions prepended to every user message (avoids 'system' role rejection on o1/o3)
 _INSTRUCTIONS = (
     "You are an AI with the instincts of a seasoned gambler, the rigour of an "
@@ -37,6 +43,10 @@ _INSTRUCTIONS = (
     "or recommend numbers. Each combination was generated locally; explain the supplied "
     "generator method for that slot. Logistic regression uses learned historical "
     "associations as sampling weights; uniform sampling uses no learned weights. "
+    "A hybrid ticket takes part of its numbers from those ML scores and the rest from "
+    "lucky-number sources of the draw date (Chinese day pillar and feng shui, numerology, "
+    "birth date, the player's own numbers); the lucky sources are cultural conventions, "
+    "have no supplied evaluation, and no demonstrated predictive power. "
     "Scores are not calibrated odds or joint ticket probabilities. Coefficients are "
     "standardized associations, not causal effects or per-number explanations.\n"
     "Assume fair, independent draws: every valid unordered combination has the same "
@@ -80,7 +90,11 @@ def _generation_context(generation: dict, pool: list[int], picks: int,
     if not isinstance(generation, dict):
         raise ValueError("Supplied generation must be a dictionary.")
     method = generation.get("method")
-    if method not in ("logistic_regression", "uniform_fallback"):
+    if method not in ("logistic_regression", "uniform_fallback", "hybrid_ml_lucky"):
+        raise ValueError("Unsupported supplied generation method.")
+    hybrid = method == "hybrid_ml_lucky"
+    ml_kind = generation.get("ml_method") if hybrid else method
+    if ml_kind not in ("logistic_regression", "uniform_fallback"):
         raise ValueError("Unsupported supplied generation method.")
     tickets = generation.get("combinations")
     if not isinstance(tickets, list) or not tickets:
@@ -129,25 +143,47 @@ def _generation_context(generation: dict, pool: list[int], picks: int,
         evaluation_text = json.dumps(evaluation, allow_nan=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
         raise ValueError("Generation evaluation must contain finite JSON data.") from exc
-    lines = [f"Generator method: {method}",
+    ml_numbers, lucky_numbers = chosen, []
+    if hybrid:
+        first = (generation.get("tickets") or [None])[0]
+        if not isinstance(first, dict):
+            raise ValueError("Hybrid generation requires per-half tickets.")
+        ml_numbers, lucky_numbers = first.get("ml"), first.get("lucky")
+        if (not isinstance(ml_numbers, list) or not isinstance(lucky_numbers, list)
+                or any(isinstance(v, bool) or not isinstance(v, Integral) or v not in pool
+                       for v in ml_numbers + lucky_numbers)
+                or (ml_numbers + lucky_numbers if ordered else sorted(ml_numbers + lucky_numbers))
+                != (chosen if ordered else sorted(chosen))):
+            raise ValueError("Hybrid ML and lucky halves must make up the first combination.")
+        ml_numbers, lucky_numbers = [int(v) for v in ml_numbers], [int(v) for v in lucky_numbers]
+    lines = [f"Generator method: {method}" + (f" (ML half method: {ml_kind})" if hybrid else ""),
              f"Training draws: {generation.get('training_draws', 'not supplied')}",
-             f"Full evaluation metrics: {evaluation_text}",
+             f"Full evaluation metrics{' (ML half only)' if hybrid else ''}: {evaluation_text}",
              "Brier measures prediction error, not winning odds; historical improvement "
              "does not prove a winning edge."]
-    if method == "logistic_regression":
+    if hybrid:
+        lines.append(
+            f"Ticket structure: {len(ml_numbers)} {'digit(s) in the first positions' if ordered else 'number(s)'} "
+            f"from the ML half {ml_numbers} + {len(lucky_numbers)} from the lucky half {lucky_numbers}"
+            + (f" for the draw on {generation['draw_date']}." if generation.get("draw_date") else ".")
+            + " This first ticket takes the strongest ML numbers, then the highest-scoring lucky "
+            "numbers the ML half did not take.")
+    if ml_kind == "logistic_regression":
         selected = []
-        for position, number in enumerate(chosen, 1):
+        for position, number in enumerate(ml_numbers, 1):
             key = (position if ordered else None, number)
             if key not in indexed:
                 raise ValueError("Missing model score for a selected number/position.")
             selected.append({"number": number, **({"position": position} if ordered else {}),
                              "score": indexed[key]})
         lines.extend([
-            "Selected number model scores: " + json.dumps(selected, separators=(",", ":")),
+            "Selected number model scores" + (" (ML half)" if hybrid else "") + ": "
+            + json.dumps(selected, separators=(",", ":")),
             "Feature coefficients (standardized associations, not causal effects): "
             + json.dumps({name: float(value) for name, value in weights.items()},
                          separators=(",", ":")),
-            "RNG chooses a score-weighted sample, not guaranteed highest-ranked numbers. "
+            ("RNG chooses a score-weighted sample, not guaranteed highest-ranked numbers. "
+             if not hybrid else "") +
             "These scores are not calibrated odds. Without per-number feature values, "
             "do not invent individual feature contributions.",
         ])
@@ -156,6 +192,30 @@ def _generation_context(generation: dict, pool: list[int], picks: int,
             raise ValueError("Uniform fallback must not supply learned scores or coefficients.")
         lines.append("Uniform random sampling, no learned weights or model-selected numbers; "
                      "do not fabricate ML explanations.")
+    if hybrid:
+        lucky = generation.get("lucky")
+        if not isinstance(lucky, dict) or not isinstance(lucky.get("profile"), dict):
+            raise ValueError("Hybrid generation requires the lucky-number profile.")
+        lucky_score = {int(r["number"]): float(r["score"]) for r in lucky.get("scores", [])
+                       if isinstance(r, dict) and isinstance(r.get("number"), Integral)
+                       and isinstance(r.get("score"), Real) and math.isfinite(r["score"])}
+        sources = lucky.get("reasons") if isinstance(lucky.get("reasons"), dict) else {}
+        evidence = [{"number": number, "lucky_score": round(lucky_score.get(number, 0.0), 2),
+                     "sources": [compact_text(why, 80) for why in sources.get(str(number), [])][:8]}
+                    for number in lucky_numbers]
+        profile = {k: v for k, v in lucky["profile"].items() if k != "date"}
+        personal = {k: v for k, v in (lucky.get("personal") or {}).items() if v}
+        lines.extend([
+            "Lucky draw-date profile: " + json.dumps(profile, separators=(",", ":")),
+            "Lucky half evidence (score adds up every source that endorses the number; digits "
+            "containing 4 are discounted in the Chinese sources): "
+            + json.dumps(evidence, separators=(",", ":")),
+            ("Personal inputs: " + json.dumps(personal, separators=(",", ":"))) if personal
+            else "Personal inputs: none supplied.",
+            "Lucky sources are traditional conventions applied to the draw date, not statistics: "
+            "they come with no evaluation and no demonstrated predictive power. Explain which "
+            "supplied sources endorse each lucky number and invent no others.",
+        ])
     adjusted = generation.get("bet_feedback_numbers")
     if isinstance(adjusted, Integral) and not isinstance(adjusted, bool) and adjusted > 0:
         lines.append(f"Scores were rescaled (x0.75 to x1.25) for {int(adjusted)} numbers using "
@@ -402,7 +462,14 @@ class AzureAIClient:
             "evidence_of_improvement as supplied, including unavailable metrics; Brier is "
             "not winning odds and even positive evidence does not prove an edge. For "
             "uniform_fallback explain uniform sampling and its fallback reason, with no "
-            "fabricated ML. Without supplied generation, explain uniform sampling only. "
+            "fabricated ML. For hybrid_ml_lucky, write REASONING in three short parts: "
+            "'ML half' (the supplied scores for the ML numbers, coefficients and evaluation, "
+            "which cover the ML half only), 'Lucky half' (the draw-date profile and, for each "
+            "lucky number, the supplied sources that endorse it, noting that these are cultural "
+            "conventions with no supplied evaluation), and 'How they combine' (one or two "
+            "sentences on how the ticket joins the halves). Skip the long frequency and "
+            "chi-square digressions: mention them only briefly. Without supplied generation, "
+            "explain uniform sampling only. "
             "If heat map summary, feature analysis, or trend data is supplied, reference specific hot, "
             "cold, or overdue numbers and explain how this game's pool size and draw frequency affect "
             "the feature landscape. "
@@ -422,7 +489,7 @@ class AzureAIClient:
         response = self._client().chat.completions.create(
             model=self._deployment,
             messages=[{"role": "user", "content": user_content}],
-            max_completion_tokens=min(4096, 1024 * len(slots)),
+            max_completion_tokens=min(MAX_COMPLETION_TOKENS, TOKENS_PER_SLOT * len(slots)),
         )
         if not response.choices:
             raise RuntimeError("Azure AI returned no explanation.")
@@ -439,6 +506,63 @@ class AzureAIClient:
                 result[label]["generation"] = generations[label]
         return result
 
+
+    def find_lucky_numbers(self, game_name: str, low: int, high: int, count: int,
+                           profile: dict, personal: dict | None = None) -> list[dict]:
+        """Ask the model for lucky numbers of a draw date, as [{"number", "reason"}].
+
+        The model has no live web access: it answers from training knowledge, using
+        the calendar facts in ``profile`` (computed locally, so it need not work out
+        the day pillar itself). Its numbers are one more lucky source, not predictions.
+        Output is validated: integers in [low, high], no repeats, at most ``count``.
+        """
+        import re
+
+        if not self.is_configured():
+            raise RuntimeError(self.setup_instructions())
+        facts = json.dumps(profile, separators=(",", ":"))
+        extra = json.dumps({k: v for k, v in (personal or {}).items() if v}, separators=(",", ":"))
+        prompt = (
+            "You are an expert in the Chinese almanac (Tung Shing), feng shui, Chinese zodiac "
+            "numerology and Western numerology. Suggest lucky numbers for a lottery draw date "
+            "the way a traditional fortune advisor would. These are cultural lucky numbers, "
+            "not predictions, and you must not claim they raise the chance of winning.\n"
+            f"Game: {compact_text(game_name)}. Numbers must be whole numbers from {low} to {high}.\n"
+            f"Calendar facts for the draw date, already computed and correct, do not recompute: {facts}\n"
+            + (f"Personal details: {extra}\n" if extra != "{}" else "")
+            + f"Suggest exactly {count} different numbers. For each, give a one-sentence reason "
+            "naming the tradition and the calendar fact it rests on (for example day element, "
+            "zodiac animal, flying star, auspicious sound of a digit, numerology). "
+            "Do not invent calendar facts beyond those supplied, and say nothing about web "
+            "access or real-time data.\n"
+            'Reply with JSON only, no markdown: {"numbers":[{"number":<int>,"reason":"<text>"}]}'
+        )
+        self.last_prompt = prompt
+        response = self._client().chat.completions.create(
+            model=self._deployment,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=ANALYSIS_TOKENS,
+        )
+        if not response.choices:
+            raise RuntimeError("Azure AI returned no lucky numbers.")
+        choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise RuntimeError("Azure AI lucky numbers were truncated by the token limit.")
+        text = (choice.message.content or "").strip()
+        match = re.search(r"\{.*\}", text, re.S)
+        try:
+            rows = json.loads(match.group(0))["numbers"] if match else []
+        except (ValueError, KeyError, TypeError):
+            rows = []
+        found: dict[int, str] = {}
+        for row in rows if isinstance(rows, list) else []:
+            number = row.get("number") if isinstance(row, dict) else None
+            if (isinstance(number, Integral) and not isinstance(number, bool)
+                    and low <= number <= high and int(number) not in found):
+                found[int(number)] = compact_text(row.get("reason", ""), 200) or "AI suggestion"
+        if not found:
+            raise RuntimeError("Azure AI returned no usable lucky numbers; try again.")
+        return [{"number": n, "reason": why} for n, why in list(found.items())[:count]]
 
     def interpret_arena(
         self,
@@ -522,7 +646,7 @@ class AzureAIClient:
         response = self._client().chat.completions.create(
             model=self._deployment,
             messages=[{"role": "user", "content": user_content}],
-            max_completion_tokens=3000,
+            max_completion_tokens=ANALYSIS_TOKENS,
         )
         if not response.choices:
             raise RuntimeError("Azure AI returned no analysis.")
@@ -602,7 +726,7 @@ class AzureAIClient:
         response = self._client().chat.completions.create(
             model=self._deployment,
             messages=[{"role": "user", "content": user_content}],
-            max_completion_tokens=3000,
+            max_completion_tokens=ANALYSIS_TOKENS,
         )
         if not response.choices:
             raise RuntimeError("Azure AI returned no selection.")
@@ -684,7 +808,7 @@ class AzureAIClient:
         response = self._client().chat.completions.create(
             model=self._deployment,
             messages=[{"role": "user", "content": user_content}],
-            max_completion_tokens=300,
+            max_completion_tokens=CHART_TOKENS,
         )
         raw = response.choices[0].message.content or ""
         raw = _re.sub(r"(?i)^explanation\s*:\s*", "", raw.strip())

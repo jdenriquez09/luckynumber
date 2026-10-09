@@ -13,6 +13,7 @@ from streamlit.testing.v1 import AppTest
 
 from api import db
 from src.lotto.crowd import crowd_games
+from src.lotto.games import GAMES
 from tests.conftest import _fair_draws
 
 APP_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "app.py"
@@ -144,45 +145,55 @@ def test_arena_page_ai_analysis_button(arena_app, monkeypatch):
     assert any(i.value == "VERDICT: offline analysis text" for i in app.info)
 
 
-def test_arena_page_ai_picks_tickets_from_the_shortlist(arena_app, monkeypatch):
-    import json
-    import re
-    from types import SimpleNamespace
-    from src.lotto.azure_ai import AzureAIClient
+def test_arena_page_next_tickets_default_to_hybrid_ml_plus_lucky_and_save_both_halves(arena_app):
+    import datetime as dt
+    from src.lotto.lucky import next_draw_date
 
     app, conn = arena_app
-    for name, value in {"AZURE_OPENAI_ENDPOINT": "https://offline.invalid",
-                        "AZURE_OPENAI_API_KEY": "offline-test-only",
-                        "AZURE_OPENAI_DEPLOYMENT": "offline-test"}.items():
-        monkeypatch.setenv(name, value)
-
-    def reply(**kwargs):
-        prompt = kwargs["messages"][0]["content"]
-        menu = [json.loads(m) for m in re.findall(r"^\d+\. (\[[\d, ]+\]) crowd index", prompt, re.M)]
-        picks = [menu[1], menu[0]]
-        return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
-            content=json.dumps({"tickets": picks + [[1, 2, 3, 4, 5, 6]], "reasoning": "Offline reasoning."})))])
-
-    sdk = Mock()
-    sdk.chat.completions.create.side_effect = reply
-    monkeypatch.setattr(AzureAIClient, "_client", Mock(return_value=sdk))
-    monkeypatch.setattr(db, "load_bet_history", Mock(return_value=[]))
     app.run()
-    app.slider(key="arena_next_count").set_value(2)
-    app.button(key="arena_ai_pick").click().run()
+    assert not app.exception and not app.error
+    assert app.selectbox(key="arena_next_strategy").value == "hybrid"
+    assert not any(b.key == "arena_ai_pick" for b in app.button)  # one way to generate tickets
+    assert app.date_input(key="arena_bet_date").value == next_draw_date(GAMES["655"])
+    app.date_input(key="arena_bet_date").set_value(dt.date(2026, 10, 9))
+    app.slider(key="arena_next_count").set_value(4)
+    app.button(key="arena_next_go").click().run()
     assert not app.exception and not app.error, [e.value for e in app.error]
-    sdk.chat.completions.create.assert_called_once()
-    prompt = sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
-    assert "Choose exactly 2 tickets" in prompt and "Number context:" in prompt
-    assert any("AI chose 2 of 2 tickets" in s.value for s in app.success)
-    assert any(i.value == "Offline reasoning." for i in app.info)
+    state = app.session_state["arena_next"]
+    assert state["strategy"] == "hybrid" and state["draw_date"] == dt.date(2026, 10, 9)
+    assert len(state["halves"]) == 4
+    for half, ticket in zip(state["halves"], state["tickets"]):
+        assert (len(half["ml"]), len(half["lucky"])) == (3, 3)
+        assert sorted(half["ml"] + half["lucky"]) == ticket
     shown = next(d.value for d in app.dataframe if "ticket" in d.value.columns)
-    assert len(shown) == 2 and (shown["crowd index (1.0 = average)"] < 1).all()
-    assert any(c.value == prompt for c in app.code)
+    assert {"🤖 ML numbers", "🧧 Lucky numbers"} <= set(shown.columns) and len(shown) == 4
+    assert any("Bing-Chen" in c.value for c in app.caption)  # lucky profile of the chosen date
+    why = next(d.value for d in app.dataframe if "why" in d.value.columns)
+    assert len(why) == 4 * 6 and set(why["from"]) == {"🤖 ML", "🧧 Lucky"}
+    assert set(why[why["ticket"] == 1]["number"]) == {f"{v:02d}" for v in state["tickets"][0]}
+    assert why[why["from"] == "🤖 ML"]["why"].str.startswith("ML score").all()
+    assert why[why["from"] == "🧧 Lucky"]["why"].str.startswith("lucky score").all()
+    assert any("Where each number comes from" in e.label for e in app.expander)
     app.button(key="arena_save").click().run()
     inserts = [c for c in conn.execute.call_args_list if "INSERT INTO saved_combinations" in c.args[0]]
-    assert len(inserts) == 2
-    assert inserts[0].args[1][3] == "Strategy Arena: AI-curated (ML + crowd shortlist)"
+    assert len(inserts) == 4
+    params = inserts[0].args[1]
+    half = state["halves"][0]
+    assert params[3] == (f"Strategy Arena: Hybrid (half ML, half lucky numbers) — "
+                         f"ML {half['ml']} + lucky {half['lucky']} for 2026-10-09")
+    assert params[5] == dt.date(2026, 10, 9)
+
+
+def test_arena_page_warns_when_the_draw_date_changes_after_generating(arena_app):
+    import datetime as dt
+
+    app, _ = arena_app
+    app.run()
+    app.button(key="arena_next_go").click().run()
+    assert not any("draw date changed" in w.value for w in app.warning)
+    app.date_input(key="arena_bet_date").set_value(dt.date(2027, 1, 5))
+    app.run()
+    assert any("draw date changed" in w.value for w in app.warning)
 
 
 def test_arena_page_each_click_draws_fresh_tickets_with_a_visible_seed(arena_app):
@@ -196,3 +207,51 @@ def test_arena_page_each_click_draws_fresh_tickets_with_a_visible_seed(arena_app
     second = app.session_state["arena_next"]
     assert first["seed"] != second["seed"] and first["tickets"] != second["tickets"]
     assert any(f"Sampling seed {second['seed']}" in c.value for c in app.caption)
+
+
+def test_arena_page_ignores_tickets_saved_by_an_older_session(arena_app):
+    app, _ = arena_app
+    # Shape written before the draw date and halves were stored, including the removed AI mode.
+    app.session_state["arena_next"] = {"game": "655", "draw_time": "21:00", "strategy": "ai_curated",
+                                       "seed": 1, "tickets": [[1, 2, 3, 4, 5, 6]]}
+    app.run()
+    assert not app.exception and not app.error
+    assert not any(b.key == "arena_save" for b in app.button)
+    app.button(key="arena_next_go").click().run()
+    assert not app.exception and any(b.key == "arena_save" for b in app.button)
+
+
+def test_arena_page_asks_the_ai_for_lucky_numbers_and_uses_them(arena_app, monkeypatch):
+    import datetime as dt
+    import json
+    from types import SimpleNamespace
+    from src.lotto.azure_ai import AzureAIClient
+
+    app, _ = arena_app
+    for name, value in {"AZURE_OPENAI_ENDPOINT": "https://offline.invalid",
+                        "AZURE_OPENAI_API_KEY": "offline-test-only",
+                        "AZURE_OPENAI_DEPLOYMENT": "offline-test"}.items():
+        monkeypatch.setenv(name, value)
+    sdk = Mock()
+    suggested = {n: f"reason for {n}" for n in (5, 10, 15, 20, 25, 30)}
+    sdk.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason="stop", message=SimpleNamespace(content=json.dumps(
+            {"numbers": [{"number": n, "reason": why} for n, why in suggested.items()]})))])
+    monkeypatch.setattr(AzureAIClient, "_client", Mock(return_value=sdk))
+    app.run()
+    app.date_input(key="arena_bet_date").set_value(dt.date(2026, 10, 9))
+    app.run()
+    app.button(key="arena_ai_lucky_btn").click().run()
+    assert not app.exception and not app.error, [e.value for e in app.error]
+    sdk.chat.completions.create.assert_called_once()
+    assert "Bing-Chen" in sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+    assert any("AI lucky numbers" in c.value and "05" in c.value for c in app.caption)
+    app.slider(key="arena_next_count").set_value(2)
+    app.button(key="arena_next_go").click().run()
+    assert not app.exception and not app.error
+    state = app.session_state["arena_next"]
+    assert state["ai_numbers"] == suggested
+    why = next(d.value for d in app.dataframe if "why" in d.value.columns)
+    assert why["why"].str.contains("AI suggestion: reason for").any()  # the AI numbers reach the tickets
+    app.button(key="arena_ai_lucky_clear").click().run()
+    assert not any("AI lucky numbers" in c.value for c in app.caption)

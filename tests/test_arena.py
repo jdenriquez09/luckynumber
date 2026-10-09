@@ -177,7 +177,7 @@ def test_arena_with_ml_and_crowd_strategies(crowd_model):
     result = arena.run_arena(frame, GAMES["655"], test_draws=30, tickets_per_draw=3,
                              crowd=crowd_model, ml_refit_every=15)
     table = result.table.set_index("key")
-    assert set(table.index) == {"uniform", "hot", "overdue", "ml", "crowd", "ml_crowd"}
+    assert set(table.index) == {"uniform", "hot", "overdue", "ml", "lucky", "hybrid", "crowd", "ml_crowd"}
     assert table.loc["crowd", "share_gain_pct"] > 0
     assert table.loc["crowd", "jackpot_share_kept"] > table.loc["uniform", "jackpot_share_kept"]
 
@@ -195,7 +195,7 @@ def test_arena_validates_inputs(crowd_model):
     assert "crowd" not in arena.available_strategies(GAMES["655"], None)
 
 
-@pytest.mark.parametrize("strategy", ["uniform", "hot", "overdue", "ml", "crowd", "ml_crowd"])
+@pytest.mark.parametrize("strategy", ["uniform", "hot", "overdue", "ml", "lucky", "hybrid", "crowd", "ml_crowd"])
 def test_next_draw_tickets_are_valid_for_every_strategy(crowd_model, strategy):
     cfg = GAMES["655"]
     frame = _crowded_frames(draws=260)["655"]

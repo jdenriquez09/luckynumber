@@ -1,3 +1,4 @@
+from datetime import date
 import sys
 from pathlib import Path
 from typing import Literal
@@ -10,6 +11,7 @@ from src.lotto.games import GAMES
 import src.lotto.analysis as an
 import src.lotto.predict as pred
 import src.lotto.lean_ml as lean_ml
+import src.lotto.lucky as lucky
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
@@ -52,8 +54,12 @@ def _load_draws(game_cfg) -> "pd.DataFrame":
     return df
 
 
-def _generate(df, game_cfg, *, method, n, window, draw_time) -> dict:
+def _generate(df, game_cfg, *, method, n, window, draw_time, hybrid=None) -> dict:
     """Use the same seeded local generation for displayed tickets and AI context."""
+    if method == "hybrid":
+        return lucky.hybrid_generation(
+            df, game_cfg, n=n, window=window, draw_time=draw_time, seed=42, **(hybrid or {}),
+        )
     if method == "ml":
         return lean_ml.generate_ml_combinations(
             df, game_cfg, n=n, window=window, draw_time=draw_time, seed=42,
@@ -76,9 +82,17 @@ def get_probability(
     window: int | None = Query(default=None, gt=0, description="Limit to last N draws; omit for all"),
     n_suggestions: int = Query(default=5, ge=1, le=20),
     draw_time: str | None = Query(default=None, description="Filter to a specific draw time, e.g. '14:00'"),
-    method: Literal["ml", "uniform"] = Query(default="ml"),
+    method: Literal["ml", "uniform", "hybrid"] = Query(default="ml", description=(
+        "hybrid = ml_count numbers from the ML scores + the rest from lucky-number sources")),
+    draw_date: date | None = Query(default=None, description="Draw date for lucky numbers; default next draw"),
+    ml_count: int | None = Query(default=None, ge=0, description="Hybrid: numbers taken from ML (default picks // 2)"),
+    birthdate: date | None = Query(default=None, description="Hybrid: optional birth date for personal numbers"),
+    lucky_numbers: str | None = Query(default=None, description="Hybrid: your own lucky numbers, e.g. '7,23,41'"),
 ) -> dict:
     """Return historical heat maps and seeded local generation metadata.
+
+    method=hybrid builds every ticket from ml_count ML numbers plus lucky numbers
+    (Chinese day pillar / feng shui, numerology, birth date, your own numbers).
 
     For multi-slot ML requests without draw_time, by_draw_time maps each
     scheduled slot present in history to its generation (n_suggestions each).
@@ -96,15 +110,21 @@ def get_probability(
     heat = pred.number_heat_map(df, game_cfg, window=window, draw_time=draw_time)
     by_draw_time = {}
     generation = None
-    if method == "ml" and len(game_cfg.draw_times) > 1 and draw_time is None:
-        for dt in game_cfg.draw_times:
-            if df["draw_time"].eq(dt).any():
-                by_draw_time[dt] = _generate(
-                    df, game_cfg, method=method, n=n_suggestions, window=window, draw_time=dt,
+    hybrid = {
+        "draw_date": draw_date, "ml_count": ml_count, "birthdate": birthdate,
+        "extra_numbers": lucky.parse_extra_numbers(lucky_numbers or "", game_cfg),
+    } if method == "hybrid" else None
+    if method in ("ml", "hybrid") and len(game_cfg.draw_times) > 1 and draw_time is None:
+        for slot in game_cfg.draw_times:
+            if df["draw_time"].eq(slot).any():
+                by_draw_time[slot] = _generate(
+                    df, game_cfg, method=method, n=n_suggestions, window=window, draw_time=slot,
+                    hybrid=hybrid,
                 )
     else:
         generation = _generate(
             df, game_cfg, method=method, n=n_suggestions, window=window, draw_time=draw_time,
+            hybrid=hybrid,
         )
     summary = pred.heat_map_summary(heat)
 
@@ -126,8 +146,13 @@ def get_probability(
 
 class AISummaryRequest(BaseModel):
     window: int | None = Field(default=None, gt=0)
-    method: Literal["ml", "uniform"] = "ml"
+    method: Literal["ml", "uniform", "hybrid"] = "ml"
     n_suggestions: int = Field(default=5, ge=1, le=20)
+    # Hybrid only: lucky-number inputs (see /probability).
+    draw_date: date | None = None
+    ml_count: int | None = Field(default=None, ge=0)
+    birthdate: date | None = None
+    lucky_numbers: str | None = None
 
 
 @router.post("/{game_id}/ai_summary")
@@ -172,6 +197,9 @@ def get_ai_summary(game_id: str, body: AISummaryRequest = AISummaryRequest()) ->
         generation = _generate(
             df, game_cfg, method=body.method, n=body.n_suggestions,
             window=body.window, draw_time=dt,
+            hybrid={"draw_date": body.draw_date, "ml_count": body.ml_count, "birthdate": body.birthdate,
+                    "extra_numbers": lucky.parse_extra_numbers(body.lucky_numbers or "", game_cfg)}
+            if body.method == "hybrid" else None,
         )
         # Add heat map summary for unordered games
         heat_summary_text = ""

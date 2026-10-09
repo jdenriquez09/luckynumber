@@ -219,7 +219,7 @@ def test_ai_supplied_ml_evidence_reaches_prompt_and_cannot_replace_ticket(monkey
     assert "Any supplied combination was generated locally by uniform" not in prompt
     call = sdk.chat.completions.create.call_args.kwargs
     assert call == {"model": "test", "messages": [{"role": "user", "content": prompt}],
-                    "max_completion_tokens": 1024}
+                    "max_completion_tokens": 6000}
 
 
 @pytest.mark.parametrize("ticket", [
