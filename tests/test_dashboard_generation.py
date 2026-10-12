@@ -1,4 +1,4 @@
-"""Offline AppTest coverage of the actual Probability & AI page.
+"""Offline AppTest coverage of the actual Make Tickets page.
 
 Extract the entire page branch and shared generation helper from app.py's AST;
 never import/execute full-app startup (which can auto-scrape or write DuckDB).
@@ -44,9 +44,9 @@ def _page_source():
     branches = [
         node for node in ast.walk(tree)
         if isinstance(node, ast.If)
-        and ast.dump(node.test) == ast.dump(ast.parse('page == "Probability & AI"', mode="eval").body)
+        and ast.dump(node.test) == ast.dump(ast.parse('page == "Make Tickets"', mode="eval").body)
     ]
-    assert len(branches) == 1, "Probability & AI page must exist exactly once"
+    assert len(branches) == 1, "Make Tickets page must exist exactly once"
     # Retain actual preceding imports (st, pd, px, go, GAMES, DB alias, etc.).
     imports = [
         node for node in tree.body
@@ -237,11 +237,12 @@ def _assert_ai_click(run):
 
 
 @pytest.mark.parametrize("game_id", ["655", "3d"])
-def test_probability_default_ml_renders_scores_evaluation_and_exact_ai_ticket(dashboard, game_id):
+def test_probability_ml_assisted_baseline_renders_scores_evaluation_and_exact_ai_ticket(dashboard, game_id):
     run = dashboard(game_id)
+    run.app.session_state["prob_generation_mode"] = "ML-assisted"
     app = run.app.run()
     _assert_clean(app)
-    assert app.title[0].value == "Probability & AI Analysis"
+    assert app.title[0].value == "🎟️ Make Tickets"
     assert app.selectbox(key="prob_generation_mode").value == "ML-assisted"
     assert app.session_state["_test_last_dates"] == {game_id: date.today().isoformat()}
     assert run.loader.call_count >= 2
@@ -312,6 +313,7 @@ def test_probability_uniform_bypasses_generator_and_trainer(dashboard, monkeypat
 
 def test_ai_click_scores_bets_stores_runs_and_sends_history(dashboard):
     run = dashboard("655")
+    run.app.session_state["prob_generation_mode"] = "ML-assisted"
     history = [{"run_date": "2026-01-05", "ai_combination": [1, 2, 3, 4, 5, 6],
                 "actual_draw": [1, 2, 9, 10, 11, 12], "match_count": 2, "total_distance": 9}]
     run.stubs.history.return_value = history
@@ -334,6 +336,7 @@ def test_ai_click_scores_bets_stores_runs_and_sends_history(dashboard):
 
 def test_new_bet_feedback_rebuilds_tickets_then_runs_ai_once(dashboard):
     run = dashboard("655")
+    run.app.session_state["prob_generation_mode"] = "ML-assisted"
     app = run.app.run()
     _assert_clean(app)
     assert all("bet_feedback_numbers" not in g for g in app.session_state["_test_generation"].values())
@@ -357,6 +360,7 @@ def test_new_bet_feedback_rebuilds_tickets_then_runs_ai_once(dashboard):
 
 def test_stored_prompt_is_restored_without_session_state(dashboard):
     run = dashboard("655")
+    run.app.session_state["lucky_source_655"] = "Date rules only"
     run.stubs.latest_run.return_value = {
         "id": 7, "run_at": "2026-10-04 12:30:00", "prompt": "STORED PROMPT TEXT",
     }
@@ -370,10 +374,11 @@ def test_stored_prompt_is_restored_without_session_state(dashboard):
 @pytest.mark.parametrize("game_id", ["655", "3d"])
 def test_probability_hybrid_renders_halves_and_explains_both_in_the_ai_prompt(dashboard, game_id):
     run = dashboard(game_id)
-    run.app.session_state["prob_generation_mode"] = "Hybrid: ML + Lucky numbers"
+    run.app.session_state[f"lucky_source_{game_id}"] = "Date rules only"
     run.app.session_state[f"lucky_date_{game_id}"] = date(2026, 10, 9)
     app = run.app.run()
     _assert_clean(app)
+    assert app.selectbox(key="prob_generation_mode").value == "Hybrid: ML + Lucky numbers"  # the standard
     generations = app.session_state["_test_generation"]
     assert list(generations) == run.labels
     rows = [e.value for e in app.markdown if e.value.startswith("**#") and "🧧" in e.value]
@@ -407,22 +412,50 @@ def test_probability_hybrid_renders_halves_and_explains_both_in_the_ai_prompt(da
     assert len([b for b in app.button if b.key.startswith("save_hyb_")]) == 5 * len(run.labels)
 
 
-def test_probability_hybrid_asks_ai_for_lucky_numbers_and_feeds_the_tickets(dashboard):
+def _lucky_reply(numbers):
+    return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+        content=json.dumps({"numbers": [{"number": n, "reason": why} for n, why in numbers.items()]})))])
+
+
+def test_probability_hybrid_asks_the_ai_for_the_lucky_shortlist_and_draws_from_it(dashboard):
     run = dashboard("655")
-    suggested = {5: "Earth day", 10: "Ten is complete", 15: "Half of thirty"}
-    run.sdk.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
-        finish_reason="stop", message=SimpleNamespace(content=json.dumps(
-            {"numbers": [{"number": n, "reason": why} for n, why in suggested.items()]})))])
-    run.app.session_state["prob_generation_mode"] = "Hybrid: ML + Lucky numbers"
+    suggested = {n: f"reason for {n}" for n in (5, 10, 15, 20, 25, 30, 35, 40)}
+    run.sdk.chat.completions.create.return_value = _lucky_reply(suggested)
     run.app.session_state["lucky_date_655"] = date(2026, 10, 9)
     app = run.app.run()
     _assert_clean(app)
-    run.sdk.chat.completions.create.assert_not_called()
-    app.button(key="ai_lucky_btn_655").click().run()
+    create = run.sdk.chat.completions.create
+    create.assert_called_once()  # asked automatically, without a click
+    assert "Bing-Chen" in create.call_args.kwargs["messages"][0]["content"]
+    assert app.radio(key="lucky_source_655").value == "AI picks, date rules rank"
+    for result in app.session_state["_test_generation"].values():
+        assert result["lucky_source"] == "ai_shortlist+date_rules"
+        assert sorted(result["lucky"]["personal"]["ai_numbers"]) == sorted(suggested)
+        assert all(set(t["lucky"]) <= set(suggested) for t in result["tickets"])
+        assert result["lucky"]["reasons"]["10"][-1] == "AI suggestion: reason for 10"
+    assert any("AI lucky numbers for 2026-10-09" in c.value for c in app.caption)
+    app.run()
+    assert create.call_count == 1  # the answer is cached for that game and date
+    create.return_value = _lucky_reply({n + 1: f"fresh {n + 1}" for n in suggested})
+    app.button(key="ai_lucky_again_655").click().run()
     _assert_clean(app)
-    run.sdk.chat.completions.create.assert_called_once()
-    assert "Bing-Chen" in run.sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
-    assert any("AI lucky numbers" in c.value for c in app.caption)
-    lucky = next(iter(app.session_state["_test_generation"].values()))["lucky"]
-    assert sorted(lucky["personal"]["ai_numbers"]) == [5, 10, 15]
-    assert lucky["reasons"]["10"][-1] == "AI suggestion: Ten is complete"
+    assert create.call_count == 2  # "Ask the AI again" gets a fresh shortlist
+    result = next(iter(app.session_state["_test_generation"].values()))
+    assert all(set(t["lucky"]) <= {n + 1 for n in suggested} for t in result["tickets"])
+    app.radio(key="lucky_source_655").set_value("Date rules only").run()
+    _assert_clean(app)
+    assert create.call_count == 2  # date rules only: no AI call
+    assert next(iter(app.session_state["_test_generation"].values()))["lucky_source"] == "date_rules"
+
+
+def test_probability_hybrid_falls_back_to_the_date_rules_when_the_ai_cannot_help(dashboard):
+    run = dashboard("655")
+    run.sdk.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason="stop", message=SimpleNamespace(content="Sorry, no numbers today."))])
+    run.app.session_state["lucky_date_655"] = date(2026, 10, 9)
+    app = run.app.run()
+    _assert_clean(app)  # a warning, not an error: the page still works
+    assert any("could not provide lucky numbers" in w.value and "date rules only" in w.value for w in app.warning)
+    result = next(iter(app.session_state["_test_generation"].values()))
+    assert result["lucky_source"] == "date_rules" and len(result["tickets"]) == 5
+

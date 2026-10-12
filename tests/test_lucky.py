@@ -157,31 +157,32 @@ def test_arena_scores_lucky_and_hybrid_strategies_walk_forward():
     assert {"lucky", "hybrid"} <= set(arena.available_strategies(game, None))
 
 
-def test_arena_next_draw_tickets_for_lucky_strategies():
+def test_generate_tickets_is_the_one_standard_path():
+    from src.lotto.tickets import STANDARD_METHOD, generate_tickets
+
     game = GAMES["658"]
-    frame = _fair_draws(game, n=150, seed=2)
-    day = dt.date(2026, 10, 9)
-    for strategy in ("lucky", "hybrid"):
-        tickets = arena.next_draw_tickets(frame, game, strategy, n=4, draw_date=day, ml_window=120)
-        _tickets_valid(tickets, game, 4)
-    assert arena.next_draw_tickets(frame, game, "lucky", n=1, draw_date=day) == [
-        sorted(row["number"] for row in lucky.lucky_scores(game, day).top(6))]
+    draws, day = _draws(game, 150), dt.date(2026, 10, 9)
+    standard = generate_tickets(draws, game, n=4, draw_date=day, extra_numbers=[7])
+    assert standard["method"] == STANDARD_METHOD == "hybrid_ml_lucky"
+    same = lucky.hybrid_generation(draws, game, n=4, draw_date=day, extra_numbers=[7])
+    assert standard == same  # no second recipe hiding behind the entry point
+    assert [(len(t["ml"]), len(t["lucky"])) for t in standard["tickets"]] == [(3, 3)] * 4
+    assert all("crowd_index" not in t for t in standard["tickets"])  # only with a crowd model
 
 
-def test_next_draw_hybrid_tickets_expose_halves_and_match_next_draw_tickets():
-    game = GAMES["658"]
-    frame = _fair_draws(game, n=150, seed=2)
-    day = dt.date(2026, 10, 9)
-    halves = arena.next_draw_hybrid_tickets(frame, game, n=4, seed=11, draw_date=day, ml_window=120)
-    assert [(len(h["ml"]), len(h["lucky"])) for h in halves] == [(3, 3)] * 4
-    assert all(len(h["ml_scores"]) == 3 and all(0 < v < 1 for v in h["ml_scores"]) for h in halves)
-    assert [h["numbers"] for h in halves] == arena.next_draw_tickets(
-        frame, game, "hybrid", n=4, seed=11, draw_date=day, ml_window=120)
-    mine = arena.next_draw_hybrid_tickets(frame, game, n=1, seed=11, draw_date=day, ml_window=120,
-                                          extra_numbers=[50, 51, 52], ml_count=0)
-    expected = lucky.lucky_scores(game, day, extra_numbers=[50, 51, 52]).top(6)
-    assert mine[0]["ml"] == [] and mine[0]["lucky"] == sorted(r["number"] for r in expected)
-    assert 51 in mine[0]["lucky"]  # own numbers count: 51 outranks its neighbours without them
+def test_generate_tickets_adds_crowd_info_for_six_number_games_only():
+    from src.lotto.crowd import fit_crowd_model
+    from src.lotto.tickets import generate_tickets
+    from tests.test_arena import _crowded_frames
+
+    model = fit_crowd_model(_crowded_frames())
+    game, day = GAMES["655"], dt.date(2026, 10, 9)
+    result = generate_tickets(_draws(game, 150), game, n=3, draw_date=day, crowd=model)
+    assert all(t["crowd_index"] > 0 and 0 < t["share_kept"] <= 1 for t in result["tickets"])
+    ordered = generate_tickets(_draws(GAMES["3d"], 150), GAMES["3d"], n=3, draw_date=day, crowd=model)
+    assert all("crowd_index" not in t for t in ordered["tickets"])
+    assert generate_tickets(_draws(game, 150), game, n=3, draw_date=day) ["tickets"][0]["numbers"] == \
+        result["tickets"][0]["numbers"]  # crowd info annotates, it never changes the tickets
 
 
 def _ai_client(monkeypatch, content, finish="stop"):
@@ -237,3 +238,83 @@ def test_ai_numbers_add_one_more_scored_source_with_their_reason():
     result = lucky.hybrid_generation(_draws(game, 120), game, n=2, draw_date=day,
                                      ai_numbers={50: "water brings wealth"})
     assert "AI suggestion: water brings wealth" in result["lucky"]["reasons"]["50"]
+
+
+def _year_of_tops(game, start=dt.date(2026, 10, 13), k=6):
+    days = [start + dt.timedelta(days=i) for i in range(365)]
+    days = [d for d in days if d.strftime("%a") in game.draw_days]
+    return days, [[r["number"] for r in lucky.lucky_scores(game, d).top(k)] for d in days]
+
+
+@pytest.mark.parametrize("game_id", ["658", "645", "642"])
+def test_lucky_numbers_follow_the_draw_date_not_a_fixed_favourite_list(game_id):
+    import collections
+
+    days, tops = _year_of_tops(GAMES[game_id])
+    most_common = collections.Counter(n for t in tops for n in t).most_common(1)[0][1]
+    assert most_common / len(days) < 0.45  # no number sits in the top six on most draw dates
+    overlap = np.mean([len(set(a[:3]) & set(b[:3])) for a, b in zip(tops, tops[1:])])
+    assert overlap < 0.4  # consecutive draws rarely share their strongest three
+    assert len({tuple(t[:3]) for t in tops}) > 0.9 * len(days)
+
+
+def test_evergreen_sources_are_only_tie_breakers_next_to_date_sources():
+    assert lucky.AUSPICIOUS_CAP + lucky.YEAR_STAR_WEIGHT < 1.0  # day of month alone outweighs both
+
+
+def test_day_pillar_numbers_and_he_tu_digits_come_with_reasons():
+    game = GAMES["658"]
+    day = dt.date(2026, 10, 9)  # Bing-Chen: stem Bing = 3, branch Chen = 5, element Fire (He Tu 2, 7)
+    profile = lucky.day_profile(day)
+    assert (profile["day_stem_number"], profile["day_branch_number"]) == (3, 5)
+    result = lucky.lucky_scores(game, day)
+    assert "day stem Bing = 3" in result.reasons[3] and "day branch Chen = 5" in result.reasons[5]
+    for number in (2, 7, 17, 27, 37, 47, 57, 12, 22, 32, 42, 52):
+        assert "He Tu number of Fire" in result.reasons[number]
+    assert "He Tu number of Fire" not in result.reasons[8]
+    water = lucky.lucky_scores(game, dt.date(2026, 10, 15))  # Ren-Xu: a Water day, He Tu numbers 1 and 6
+    assert water.profile["day_element"] == "Water" and "He Tu number of Water" in water.reasons[6]
+    assert "He Tu number of Fire" not in water.reasons[7] and "He Tu number of Water" not in water.reasons[7]
+
+
+def test_ai_shortlist_is_where_the_lucky_half_is_drawn_from():
+    game, day = GAMES["658"], dt.date(2026, 10, 9)
+    shortlist = {n: f"reason {n}" for n in (4, 11, 22, 33, 44, 50, 55, 57)}
+    result = lucky.hybrid_generation(_draws(game, 150), game, n=15, draw_date=day, ai_numbers=shortlist)
+    assert result["lucky_source"] == "ai_shortlist+date_rules"
+    for ticket in result["tickets"]:
+        assert set(ticket["lucky"]) <= set(shortlist)  # every ticket, not just the first
+    assert lucky.hybrid_generation(_draws(game, 150), game, n=2, draw_date=day)["lucky_source"] == "date_rules"
+
+
+def test_ai_shortlist_ranks_by_the_date_rules_and_keeps_own_numbers():
+    game, day = GAMES["658"], dt.date(2026, 10, 9)
+    shortlist = {n: "x" for n in (4, 11, 22, 33, 44, 50, 55, 57)}
+    ranked = lucky.lucky_scores(game, day, ai_numbers=shortlist)
+    in_list = sorted(shortlist, key=lambda n: (-ranked.scores[n - 1], n))
+    first = lucky.hybrid_generation(_draws(game, 150), game, n=1, draw_date=day, ai_numbers=shortlist,
+                                    ml_count=0)["tickets"][0]
+    assert first["lucky"] == sorted(in_list[:6])  # the strongest shortlisted numbers by date score
+    own = lucky.hybrid_generation(_draws(game, 150), game, n=6, draw_date=day, ai_numbers=shortlist,
+                                  extra_numbers=[1], ml_count=0)
+    assert all(set(t["lucky"]) <= set(shortlist) | {1} for t in own["tickets"])
+    assert 1 in own["tickets"][0]["lucky"]  # your own number joins the shortlist
+
+
+def test_a_small_ai_shortlist_is_topped_up_by_the_date_rules():
+    game, day = GAMES["658"], dt.date(2026, 10, 9)
+    result = lucky.hybrid_generation(_draws(game, 150), game, n=4, draw_date=day, ml_count=0,
+                                     ai_numbers={50: "only one"})
+    for ticket in result["tickets"]:
+        assert len(ticket["lucky"]) == 6 and 50 in ticket["lucky"]
+    rules = [r["number"] for r in lucky.lucky_scores(game, day, ai_numbers={50: "only one"}).top(58)
+             if r["number"] != 50][:5]
+    assert result["tickets"][0]["lucky"] == sorted(rules + [50])
+
+
+def test_ai_shortlist_works_for_ordered_games():
+    game = GAMES["3d"]
+    result = lucky.hybrid_generation(_draws(game, 150), game, n=6, draw_date=dt.date(2026, 10, 9),
+                                     ai_numbers={3: "a", 7: "b", 8: "c"})
+    for ticket in result["tickets"]:
+        assert all(d in {3, 7, 8} for d in ticket["lucky"])

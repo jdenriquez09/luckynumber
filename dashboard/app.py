@@ -79,20 +79,22 @@ def load_draws(game_id: str) -> pd.DataFrame:
 def _prob_generation(_df: pd.DataFrame, dataset_hash: str, game_id: str,
                      window: int | None, draw_time: str, n: int,
                      mode: str, model_version: str, feedback_json: str = "",
-                     hybrid_json: str = "") -> dict:
+                     hybrid_json: str = "", crowd_on: bool = False, _crowd=None) -> dict:
     """Cache per-slot tickets/metrics; explicit snapshot and version key _df."""
     import datetime as _datetime
     import json as _json
     from src.lotto.lean_ml import generate_ml_combinations, _prepare_draws
-    from src.lotto.lucky import HYBRID_MODE, hybrid_generation
+    from src.lotto.lucky import HYBRID_MODE
+    from src.lotto.tickets import generate_tickets
     from src.lotto.predict import random_combinations
 
     cfg = GAMES[game_id]
     if mode == HYBRID_MODE:
         options = _json.loads(hybrid_json)
         feedback = {int(k): float(v) for k, v in _json.loads(feedback_json).items()} if feedback_json else None
-        return hybrid_generation(
+        return generate_tickets(
             _df, cfg, n=n, window=window, draw_time=draw_time, seed=42, bet_feedback=feedback,
+            crowd=_crowd if crowd_on else None,
             draw_date=_datetime.date.fromisoformat(options["draw_date"]),
             ml_count=options["ml_count"], extra_numbers=options["extra_numbers"],
             ai_numbers={int(k): v for k, v in options.get("ai_numbers", {}).items()},
@@ -160,7 +162,7 @@ def _show_interp(template_msg: str, key_facts: str, game_name: str,
 
 PAGES = [
     "Raw Data", "Frequency Analysis", "Statistical Tests", "Completeness",
-    "Probability & AI", "Strategy Arena", "Backtest", "Advanced Stats", "Combo Tools",
+    "Make Tickets", "Strategy Arena", "Backtest", "Advanced Stats", "Combo Tools",
     "Gambler's Edge", "Data Quality", "Saved Combos",
 ]
 page = st.sidebar.radio("Navigate", PAGES)
@@ -1393,21 +1395,27 @@ elif page == "Completeness":
         st.success("No calendar gaps detected for loaded date range.")
 
 # ---------------------------------------------------------------------------
-# Page 5: Probability & AI
+# Page 5: Make Tickets (the one place tickets are made)
 # ---------------------------------------------------------------------------
 
-elif page == "Probability & AI":
+elif page == "Make Tickets":
     from src.lotto.predict import (
         number_heat_map, DISCLAIMER
     )
     import src.lotto.lean_ml as _lean_ml
     import src.lotto.lucky as _lucky
+    import src.lotto.tickets as _tickets_mod
     from src.lotto.azure_ai import AzureAIClient
     import src.lotto.analysis as _an
 
     _TIME_LABELS = {"14:00": "2:00 PM", "17:00": "5:00 PM", "21:00": "9:00 PM"}
 
-    st.title("Probability & AI Analysis")
+    st.title("🎟️ Make Tickets")
+    st.markdown(
+        "**One process, five steps:** 1️⃣ choose the game &nbsp;→&nbsp; 2️⃣ set up your lucky numbers "
+        "&nbsp;→&nbsp; 3️⃣ get your tickets (half ML, half lucky) &nbsp;→&nbsp; 4️⃣ read why "
+        "&nbsp;→&nbsp; 5️⃣ save bets and check how they did"
+    )
 
     # --- Mandatory disclaimer ---
     st.warning(
@@ -1416,6 +1424,7 @@ elif page == "Probability & AI":
         icon="⚠️",
     )
 
+    st.subheader("Step 1 · Choose the game and how much history the ML half learns from")
     game_id = game_selector()
     game_cfg = GAMES[game_id]
     df = load_draws(game_id).sort_values(["draw_date", "draw_time"])
@@ -1447,194 +1456,204 @@ elif page == "Probability & AI":
         pd.util.hash_pandas_object(df, index=False).values.tobytes()
     ).hexdigest()[:16]
 
-    # --- Number Heat Map ---
-    st.subheader("Number Heat Map")
-    st.caption(
-        "**Composite score** = blend of recent frequency and 'overdue' gap. "
-        "Higher = appeared more often recently AND/OR hasn't appeared in a while. "
-        "This is a historical measurement, not a forecast."
-    )
-
-    from src.lotto.predict import position_heat_map as _pos_heat_map
-
-    def _draw_heat_chart(heat_df, label=None):
-        if heat_df.empty:
-            return
-        if label:
-            st.markdown(f"##### {label}")
-        colors = [
-            "#22c55e" if s > 0.65 else ("#3b82f6" if s < 0.35 else "#6b7280")
-            for s in heat_df["composite_score"]
-        ]
-        fig = go.Figure(go.Bar(
-            x=heat_df["composite_score"],
-            y=heat_df["number"].astype(str),
-            orientation="h",
-            marker_color=colors,
-            hovertemplate=(
-                "Number: %{y}<br>"
-                "Composite score: %{x:.3f}<br>"
-                "Recent draws: %{customdata[0]}<br>"
-                "Current gap: %{customdata[1]} draws<extra></extra>"
-            ),
-            customdata=heat_df[["recent_draws", "current_gap"]].values,
-        ))
-        fig.update_layout(
-            height=max(300, len(heat_df) * 14),
-            yaxis={"categoryorder": "total ascending"},
-            xaxis_title="Composite Score",
-            yaxis_title="Number",
-            showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    def _draw_position_charts(pos_heat: dict, draw_time_label: str = ""):
-        if not pos_heat:
-            st.info("No data for this draw time.")
-            return
-
-        # Color legend (shown once above the tabs)
-        st.markdown(
-            "🟢 **Dark green** — significantly above expected (z > +2) &nbsp;|&nbsp; "
-            "🟩 **Light green** — slightly above expected (z +1 to +2) &nbsp;|&nbsp; "
-            "🔵 **Blue** — within normal range (|z| ≤ 1) &nbsp;|&nbsp; "
-            "🟠 **Amber** — slightly below expected (z −1 to −2) &nbsp;|&nbsp; "
-            "🔴 **Red** — significantly below expected (z < −2)"
+    # --- Background: number heat map (reference only) ---
+    with st.expander("Background: number heat map (history, for reference)"):
+        st.subheader("Number Heat Map")
+        st.caption(
+            "**Composite score** = blend of recent frequency and 'overdue' gap. "
+            "Higher = appeared more often recently AND/OR hasn't appeared in a while. "
+            "This is a historical measurement, not a forecast."
         )
 
-        tabs_p = st.tabs([f"Position {p}" for p in sorted(pos_heat.keys())])
-        for tab, pos in zip(tabs_p, sorted(pos_heat.keys())):
-            with tab:
-                ph = pos_heat[pos]
-                zs = ph["deviation_z"].values
+        from src.lotto.predict import position_heat_map as _pos_heat_map
 
-                # Color each bar by z-score direction and magnitude
-                colors_p = []
-                for z in zs:
-                    if z > 2:
-                        colors_p.append("#16a34a")   # dark green — significantly hot
-                    elif z > 1:
-                        colors_p.append("#86efac")   # light green — slightly hot
-                    elif z < -2:
-                        colors_p.append("#e05252")   # red — significantly cold
-                    elif z < -1:
-                        colors_p.append("#f59e0b")   # amber — slightly cold
-                    else:
-                        colors_p.append("#4C72B0")   # blue — normal
+        def _draw_heat_chart(heat_df, label=None):
+            if heat_df.empty:
+                return
+            if label:
+                st.markdown(f"##### {label}")
+            colors = [
+                "#22c55e" if s > 0.65 else ("#3b82f6" if s < 0.35 else "#6b7280")
+                for s in heat_df["composite_score"]
+            ]
+            fig = go.Figure(go.Bar(
+                x=heat_df["composite_score"],
+                y=heat_df["number"].astype(str),
+                orientation="h",
+                marker_color=colors,
+                hovertemplate=(
+                    "Number: %{y}<br>"
+                    "Composite score: %{x:.3f}<br>"
+                    "Recent draws: %{customdata[0]}<br>"
+                    "Current gap: %{customdata[1]} draws<extra></extra>"
+                ),
+                customdata=heat_df[["recent_draws", "current_gap"]].values,
+            ))
+            fig.update_layout(
+                height=max(300, len(heat_df) * 14),
+                yaxis={"categoryorder": "total ascending"},
+                xaxis_title="Composite Score",
+                yaxis_title="Number",
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-                expected_count = ph["count"].sum() / len(ph)
-                fig_p = go.Figure(go.Bar(
-                    x=ph["digit"].astype(str),
-                    y=ph["count"],
-                    marker_color=colors_p,
-                    hovertemplate=(
-                        "Digit: %{x}<br>"
-                        "Count: %{y}<br>"
-                        f"Expected: {expected_count:.0f}<br>"
-                        "Z-score: %{customdata:.2f}<extra></extra>"
-                    ),
-                    customdata=zs,
-                ))
-                fig_p.add_hline(
-                    y=expected_count,
-                    line_dash="dash", line_color="#55A868",
-                    annotation_text=f"Expected ({expected_count:.0f})",
-                    annotation_position="top right",
-                )
-                fig_p.update_layout(
-                    xaxis_title="Digit / Number",
-                    yaxis_title="Times drawn in this position",
-                    title=f"Position {pos} Frequency{' — ' + draw_time_label if draw_time_label else ''}",
-                )
-                st.plotly_chart(fig_p, use_container_width=True)
+        def _draw_position_charts(pos_heat: dict, draw_time_label: str = ""):
+            if not pos_heat:
+                st.info("No data for this draw time.")
+                return
 
-                # --- Plain-text interpretation ---
-                top = ph.loc[ph["count"].idxmax()]
-                bot = ph.loc[ph["count"].idxmin()]
-                hot_nums = ph[ph["deviation_z"] > 2]["digit"].tolist()
-                cold_nums = ph[ph["deviation_z"] < -2]["digit"].tolist()
+            # Color legend (shown once above the tabs)
+            st.markdown(
+                "🟢 **Dark green** — significantly above expected (z > +2) &nbsp;|&nbsp; "
+                "🟩 **Light green** — slightly above expected (z +1 to +2) &nbsp;|&nbsp; "
+                "🔵 **Blue** — within normal range (|z| ≤ 1) &nbsp;|&nbsp; "
+                "🟠 **Amber** — slightly below expected (z −1 to −2) &nbsp;|&nbsp; "
+                "🔴 **Red** — significantly below expected (z < −2)"
+            )
 
-                lines = [
-                    f"**Position {pos} summary{' (' + draw_time_label + ')' if draw_time_label else ''}:**",
-                    f"- Most frequent: digit **{int(top['digit'])}** "
-                    f"({int(top['count'])} draws, {top['frequency_pct']:.1f}% — "
-                    f"z={top['deviation_z']:+.2f})",
-                    f"- Least frequent: digit **{int(bot['digit'])}** "
-                    f"({int(bot['count'])} draws, {bot['frequency_pct']:.1f}% — "
-                    f"z={bot['deviation_z']:+.2f})",
-                ]
-                if hot_nums:
+            tabs_p = st.tabs([f"Position {p}" for p in sorted(pos_heat.keys())])
+            for tab, pos in zip(tabs_p, sorted(pos_heat.keys())):
+                with tab:
+                    ph = pos_heat[pos]
+                    zs = ph["deviation_z"].values
+
+                    # Color each bar by z-score direction and magnitude
+                    colors_p = []
+                    for z in zs:
+                        if z > 2:
+                            colors_p.append("#16a34a")   # dark green — significantly hot
+                        elif z > 1:
+                            colors_p.append("#86efac")   # light green — slightly hot
+                        elif z < -2:
+                            colors_p.append("#e05252")   # red — significantly cold
+                        elif z < -1:
+                            colors_p.append("#f59e0b")   # amber — slightly cold
+                        else:
+                            colors_p.append("#4C72B0")   # blue — normal
+
+                    expected_count = ph["count"].sum() / len(ph)
+                    fig_p = go.Figure(go.Bar(
+                        x=ph["digit"].astype(str),
+                        y=ph["count"],
+                        marker_color=colors_p,
+                        hovertemplate=(
+                            "Digit: %{x}<br>"
+                            "Count: %{y}<br>"
+                            f"Expected: {expected_count:.0f}<br>"
+                            "Z-score: %{customdata:.2f}<extra></extra>"
+                        ),
+                        customdata=zs,
+                    ))
+                    fig_p.add_hline(
+                        y=expected_count,
+                        line_dash="dash", line_color="#55A868",
+                        annotation_text=f"Expected ({expected_count:.0f})",
+                        annotation_position="top right",
+                    )
+                    fig_p.update_layout(
+                        xaxis_title="Digit / Number",
+                        yaxis_title="Times drawn in this position",
+                        title=f"Position {pos} Frequency{' — ' + draw_time_label if draw_time_label else ''}",
+                    )
+                    st.plotly_chart(fig_p, use_container_width=True)
+
+                    # --- Plain-text interpretation ---
+                    top = ph.loc[ph["count"].idxmax()]
+                    bot = ph.loc[ph["count"].idxmin()]
+                    hot_nums = ph[ph["deviation_z"] > 2]["digit"].tolist()
+                    cold_nums = ph[ph["deviation_z"] < -2]["digit"].tolist()
+
+                    lines = [
+                        f"**Position {pos} summary{' (' + draw_time_label + ')' if draw_time_label else ''}:**",
+                        f"- Most frequent: digit **{int(top['digit'])}** "
+                        f"({int(top['count'])} draws, {top['frequency_pct']:.1f}% — "
+                        f"z={top['deviation_z']:+.2f})",
+                        f"- Least frequent: digit **{int(bot['digit'])}** "
+                        f"({int(bot['count'])} draws, {bot['frequency_pct']:.1f}% — "
+                        f"z={bot['deviation_z']:+.2f})",
+                    ]
+                    if hot_nums:
+                        lines.append(
+                            f"- **Statistically above expected** (z > +2): digits {hot_nums} — "
+                            "appeared more often than chance suggests in this position."
+                        )
+                    if cold_nums:
+                        lines.append(
+                            f"- **Statistically below expected** (z < −2): digits {cold_nums} — "
+                            "appeared less often than chance suggests in this position."
+                        )
+                    if not hot_nums and not cold_nums:
+                        lines.append(
+                            "- All digits are within the normal statistical range for this position. "
+                            "No significant bias detected."
+                        )
                     lines.append(
-                        f"- **Statistically above expected** (z > +2): digits {hot_nums} — "
-                        "appeared more often than chance suggests in this position."
+                        "_Note: These are historical counts only. Each draw is an independent random event — "
+                        "past frequency does not predict future draws._"
                     )
-                if cold_nums:
-                    lines.append(
-                        f"- **Statistically below expected** (z < −2): digits {cold_nums} — "
-                        "appeared less often than chance suggests in this position."
-                    )
-                if not hot_nums and not cold_nums:
-                    lines.append(
-                        "- All digits are within the normal statistical range for this position. "
-                        "No significant bias detected."
-                    )
-                lines.append(
-                    "_Note: These are historical counts only. Each draw is an independent random event — "
-                    "past frequency does not predict future draws._"
-                )
-                st.info("\n".join(lines))
+                    st.info("\n".join(lines))
 
-    with st.spinner("Computing heat map…"):
-        if game_cfg.ordered:
-            st.caption("Position-specific frequency analysis — each chart shows how often each digit appeared in that position across all draws.")
-            if is_multi_draw:
-                pos_by_time = {
-                    dt: _pos_heat_map(
-                        df[df["draw_time"] == dt].tail(window) if window else df,
-                        game_cfg, draw_time=dt,
-                    )
+        with st.spinner("Computing heat map…"):
+            if game_cfg.ordered:
+                st.caption("Position-specific frequency analysis — each chart shows how often each digit appeared in that position across all draws.")
+                if is_multi_draw:
+                    pos_by_time = {
+                        dt: _pos_heat_map(
+                            df[df["draw_time"] == dt].tail(window) if window else df,
+                            game_cfg, draw_time=dt,
+                        )
+                        for dt in game_cfg.draw_times
+                    }
+                    tab_labels = [_TIME_LABELS.get(dt, dt) for dt in game_cfg.draw_times]
+                    tabs_dt = st.tabs(tab_labels)
+                    for tab, dt in zip(tabs_dt, game_cfg.draw_times):
+                        with tab:
+                            _draw_position_charts(pos_by_time[dt], _TIME_LABELS.get(dt, dt))
+                    heat = pd.DataFrame()
+                    heat_by_time = {dt: pd.DataFrame() for dt in game_cfg.draw_times}
+                else:
+                    pos_heat_single = _pos_heat_map(df.tail(window) if window else df, game_cfg)
+                    _draw_position_charts(pos_heat_single)
+                    heat = pd.DataFrame()
+                    heat_by_time = {}
+            elif is_multi_draw:
+                heat_by_time = {
+                    dt: number_heat_map(df, game_cfg, window=window, draw_time=dt)
                     for dt in game_cfg.draw_times
                 }
                 tab_labels = [_TIME_LABELS.get(dt, dt) for dt in game_cfg.draw_times]
-                tabs_dt = st.tabs(tab_labels)
-                for tab, dt in zip(tabs_dt, game_cfg.draw_times):
+                tabs = st.tabs(tab_labels)
+                for tab, dt in zip(tabs, game_cfg.draw_times):
                     with tab:
-                        _draw_position_charts(pos_by_time[dt], _TIME_LABELS.get(dt, dt))
-                heat = pd.DataFrame()
-                heat_by_time = {dt: pd.DataFrame() for dt in game_cfg.draw_times}
+                        h = heat_by_time[dt]
+                        _draw_heat_chart(h)
+                        with st.container():
+                            st.caption("Full table")
+                            st.dataframe(h, use_container_width=True)
+                heat = heat_by_time[game_cfg.draw_times[0]]
             else:
-                pos_heat_single = _pos_heat_map(df.tail(window) if window else df, game_cfg)
-                _draw_position_charts(pos_heat_single)
-                heat = pd.DataFrame()
+                heat = number_heat_map(df, game_cfg, window=window)
                 heat_by_time = {}
-        elif is_multi_draw:
-            heat_by_time = {
-                dt: number_heat_map(df, game_cfg, window=window, draw_time=dt)
-                for dt in game_cfg.draw_times
-            }
-            tab_labels = [_TIME_LABELS.get(dt, dt) for dt in game_cfg.draw_times]
-            tabs = st.tabs(tab_labels)
-            for tab, dt in zip(tabs, game_cfg.draw_times):
-                with tab:
-                    h = heat_by_time[dt]
-                    _draw_heat_chart(h)
-                    with st.expander("Full table"):
-                        st.dataframe(h, use_container_width=True)
-            heat = heat_by_time[game_cfg.draw_times[0]]
-        else:
-            heat = number_heat_map(df, game_cfg, window=window)
-            heat_by_time = {}
-            _draw_heat_chart(heat)
-            if not heat.empty:
-                with st.expander("Full heat map table"):
-                    st.dataframe(heat, use_container_width=True)
+                _draw_heat_chart(heat)
+                if not heat.empty:
+                    with st.container():
+                        st.caption("Full heat map table")
+                        st.dataframe(heat, use_container_width=True)
 
     # --- Local combinations: learned scoring or explicit uniform sampling ---
-    st.subheader("Combinations")
-    generation_mode = st.selectbox(
-        "Selection method", ["ML-assisted", "Uniform random", _lucky.HYBRID_MODE],
-        index=0, key="prob_generation_mode",
+    st.subheader("Step 2 · Set up your tickets")
+    st.caption(
+        "**The standard way to choose numbers in Hermes:** every ticket is half ML scores and half "
+        "lucky numbers of the draw date. The Strategy Arena page only measures how this recipe "
+        "compares with the alternatives; tickets are made here."
     )
+    with st.expander("Advanced: comparison methods (baselines)"):
+        generation_mode = st.selectbox(
+            "Selection method", [_lucky.HYBRID_MODE, "ML-assisted", "Uniform random"],
+            index=0, key="prob_generation_mode",
+            help="Hybrid is the standard. ML-assisted and Uniform random are baselines to compare against.",
+        )
     st.caption(
         "ML-assisted selection uses historical logistic-regression scores as sampling weights. "
         "At least 100 valid draws per slot are required; 30/90-draw windows fall back to uniform random. "
@@ -1642,8 +1661,7 @@ elif page == "Probability & AI":
         if generation_mode == "ML-assisted" else
         "Half of every ticket comes from the ML scores, the other half from lucky numbers of the draw "
         "date: Chinese day pillar and feng shui, numerology, your birth date and any numbers you add. "
-        "Ticket #1 uses the strongest of each; later tickets sample. The Strategy Arena scores this "
-        "hybrid against random play. **Not a prediction.**"
+        "Ticket #1 uses the strongest of each; later tickets sample. **Not a prediction.**"
         if generation_mode == _lucky.HYBRID_MODE else
         "Uniform random sampling — no learned weights. Every valid combination has the same "
         "chance in a fair draw. **Not a prediction.**"
@@ -1652,11 +1670,12 @@ elif page == "Probability & AI":
     import datetime as _dt_lucky
     from src.lotto.lucky import default_ml_count, next_draw_date, parse_extra_numbers
     _hybrid_json = ""
+    _show_crowd = False
     if generation_mode == _lucky.HYBRID_MODE:
         _hc1, _hc2, _hc3 = st.columns([1, 1, 1])
         with _hc1:
             _lucky_date = st.date_input(
-                "Draw date for lucky numbers", value=next_draw_date(game_cfg),
+                "Draw date (lucky numbers are scored for this date)", value=next_draw_date(game_cfg),
                 format="YYYY-MM-DD", key=f"lucky_date_{game_id}",
             )
         with _hc2:
@@ -1674,30 +1693,60 @@ elif page == "Probability & AI":
             "Your own lucky numbers (optional)", key=f"lucky_extra_{game_id}",
             placeholder="e.g. 7, 23, 41 — from a horoscope site, fortune cookie, dream, plate number…",
         )
-        _ai_lucky_key = f"ai_lucky_{game_id}_{_lucky_date.isoformat()}"
-        _ai_lucky_client = AzureAIClient()
-        if _ai_lucky_client.is_configured():
-            _ab1, _ab2 = st.columns([2, 1])
-            if _ab1.button("🤖 Ask AI for lucky numbers of this date", key=f"ai_lucky_btn_{game_id}"):
+        _ai_ready = AzureAIClient().is_configured()
+        _lucky_source = st.radio(
+            "Where the lucky numbers come from",
+            ["AI picks, date rules rank", "Date rules only"],
+            index=0 if _ai_ready else 1, horizontal=True, key=f"lucky_source_{game_id}",
+            help="The AI proposes a shortlist of lucky numbers for the draw date from the calendar facts "
+                 "computed here; the lucky half of every ticket is drawn from that shortlist, ranked by "
+                 "the date rules. Date rules only needs no AI.",
+        )
+        _ai_lucky_numbers: dict[int, str] = {}
+        if _lucky_source.startswith("AI"):
+            if not _ai_ready:
+                st.warning("Azure AI is not configured, so the lucky numbers use the date rules only.")
+            else:
+                _nonce_key = f"ai_lucky_nonce_{game_id}"
+
+                @st.cache_data(ttl=86400, show_spinner=False)
+                def _ai_lucky_for(game_key: str, date_iso: str, birth_iso: str, nonce: int) -> dict:
+                    return _lucky.ask_ai_lucky_numbers(
+                        AzureAIClient(), GAMES[game_key], _dt_lucky.date.fromisoformat(date_iso),
+                        _dt_lucky.date.fromisoformat(birth_iso) if birth_iso else None,
+                    )
+
                 try:
-                    with st.spinner("Asking the AI for lucky numbers…"):
-                        st.session_state[_ai_lucky_key] = _lucky.ask_ai_lucky_numbers(
-                            _ai_lucky_client, game_cfg, _lucky_date, _lucky_birth)
+                    with st.spinner("Asking the AI for the lucky numbers of this draw date…"):
+                        _ai_lucky_numbers = _ai_lucky_for(
+                            game_id, _lucky_date.isoformat(),
+                            _lucky_birth.isoformat() if _lucky_birth else "",
+                            st.session_state.get(_nonce_key, 0),
+                        )
                 except Exception as _ai_lk_exc:
-                    st.error(f"Azure AI error: {_ai_lk_exc}")
-            if _ab2.button("Clear AI numbers", key=f"ai_lucky_clear_{game_id}"):
-                st.session_state.pop(_ai_lucky_key, None)
-        _ai_lucky_numbers = st.session_state.get(_ai_lucky_key, {})
+                    st.warning(f"The AI could not provide lucky numbers ({_ai_lk_exc}); "
+                               "using the date rules only.")
+                if st.button("🔄 Ask the AI again", key=f"ai_lucky_again_{game_id}"):
+                    st.session_state[_nonce_key] = st.session_state.get(_nonce_key, 0) + 1
+                    st.rerun()
         if _ai_lucky_numbers:
             st.caption(
-                "🤖 AI lucky numbers (the AI has no live web access; it answers from training knowledge "
-                "using the calendar facts computed here, and they count as one more lucky source): "
+                f"🤖 AI lucky numbers for {_lucky_date.isoformat()}: "
                 + ", ".join(f"**{n:02d}**" for n in _ai_lucky_numbers)
+                + ". The lucky half of your tickets is drawn from these (and your own numbers); the date "
+                "rules rank them. The AI has no live web access: it answers from training knowledge "
+                "using the calendar facts computed here."
             )
             with st.expander("Why the AI suggested them"):
                 st.dataframe(pd.DataFrame(
                     [{"number": n, "reason": why} for n, why in _ai_lucky_numbers.items()]),
                     hide_index=True, use_container_width=True)
+        if not game_cfg.ordered:
+            _show_crowd = st.checkbox(
+                "Show crowd index (how likely other players hold the same numbers)",
+                key="prob_show_crowd",
+                help="Loads every six-number game once to fit the crowd model, then shows it per ticket.",
+            )
         _hybrid_json = json.dumps({
             "draw_date": _lucky_date.isoformat(), "ml_count": int(_ml_count),
             "birthdate": _lucky_birth.isoformat() if _lucky_birth else None,
@@ -1732,14 +1781,30 @@ elif page == "Probability & AI":
     _pending_ai_key = f"pending_ai_{game_id}"
     _feedback_json = st.session_state.get(_feedback_key, "")
 
+    st.subheader("Step 3 · Your tickets")
+
+    @st.cache_resource(ttl=3600, show_spinner=False)
+    def _crowd_model():
+        from src.lotto.crowd import crowd_games, fit_crowd_model
+        return fit_crowd_model({g.id: load_draws(g.id) for g in crowd_games()})
+
+    _crowd = None
+    if _show_crowd:
+        with st.spinner("Fitting the crowd model…"):
+            _crowd = _crowd_model()
+        if _crowd is None or game_id not in _crowd.game_ids:
+            st.info("Not enough winner data to fit a crowd model for this game.")
+            _crowd = None
+
     # One source of truth for display and the optional AI explanation.
     with st.spinner("Preparing combinations and chronological evaluation…"):
         generation_by_label = {
             _TIME_LABELS.get(dt, dt): _prob_generation(
                 df, _data_hash, game_id, window, dt, n_combos,
                 generation_mode,
-                _LEAN_ML_VERSION + _hashlib.sha256(_inspect.getsource(_lucky).encode()).hexdigest()[:16],
-                _feedback_json, _hybrid_json,
+                _LEAN_ML_VERSION + _hashlib.sha256(
+                    (_inspect.getsource(_lucky) + _inspect.getsource(_tickets_mod)).encode()).hexdigest()[:16],
+                _feedback_json, _hybrid_json, _crowd is not None, _crowd,
             )
             for dt in game_cfg.draw_times
         }
@@ -1793,6 +1858,8 @@ elif page == "Probability & AI":
             line.markdown(
                 f"**#{i}** &nbsp; 🤖 {ml_part} &nbsp;&nbsp;|&nbsp;&nbsp; 🧧 {lucky_part}"
                 f" &nbsp; → &nbsp; {_combo_fmt(ticket['numbers'])}"
+                + (f" &nbsp; · crowd **{ticket['crowd_index']:.2f}** · keeps {ticket['share_kept']:.1%}"
+                   if "crowd_index" in ticket else "")
             )
             if save.button("🎯", key=f"save_hyb_{game_id}_{slot_label}_{i}_{result['draw_date']}",
                            help="Save this ticket as a bet for the draw date"):
@@ -1801,6 +1868,9 @@ elif page == "Probability & AI":
             f"🤖 = {result['ml_count']} numbers from the ML scores · 🧧 = {result['lucky_count']} lucky numbers "
             f"for {result['draw_date']}. Ticket #1 uses the strongest of each. The metrics below evaluate "
             "the ML half only."
+            + (" Crowd 1.0 = an average ticket, lower means fewer other players probably hold it; "
+               "'keeps' is the share of a jackpot you would keep if it won." if any(
+                   "crowd_index" in t for t in result["tickets"]) else "")
         )
 
     def _render_generation(result: dict, slot_label: str = "") -> None:
@@ -1866,7 +1936,8 @@ elif page == "Probability & AI":
         _render_generation(_slot_result, _slot_label)
 
     # --- Azure AI Analysis ---
-    st.subheader("AI Statistical Interpretation")
+    st.markdown("---")
+    st.subheader("Step 4 · Why these numbers (AI explanation)")
     st.caption(
         f"Analysis based on **{len(df):,} draws** up to **{_prob_latest_date}**. "
         "Result persists this session — click Regenerate or Update Data for a fresh analysis."
@@ -2085,6 +2156,37 @@ elif page == "Probability & AI":
                 except Exception as exc:
                     st.error(f"Azure AI error: {exc}")
 
+    # ---- Step 5: save bets, then score them against the real draws -----------------------------
+    st.markdown("---")
+    st.subheader("Step 5 · Save bets and check how they did")
+    st.caption(
+        "Save a ticket with its 🎯 button in Step 3. When the draw is out, score your saved bets "
+        "against the real result: the ML half then learns from how your past numbers did."
+    )
+    if st.button("Score my saved bets against the latest draws", key="score_bets"):
+        try:
+            compare_with_actual(game_id)
+            _scored_feedback = bet_number_feedback(game_id)
+        except Exception as _score_exc:
+            st.warning(f"Could not score past bets: {_score_exc}")
+        else:
+            _scored_json = json.dumps(_scored_feedback, sort_keys=True) if _scored_feedback else ""
+            if _scored_json != _feedback_json:
+                st.session_state[_feedback_key] = _scored_json
+                st.rerun()  # rebuild the tickets above with the updated feedback
+            st.toast("Saved bets scored.", icon="✅")
+    _bet_rows = [
+        {"draw": r.get("run_date"), "played": "-".join(f"{n:02d}" for n in r["ai_combination"]),
+         "drawn": "-".join(f"{n:02d}" for n in r["actual_draw"]),
+         "matches": int(r.get("match_count") or 0), "miss distance": int(r.get("total_distance") or 0)}
+        for r in load_bet_history(game_id)
+        if r.get("ai_combination") and r.get("actual_draw")
+    ]
+    if _bet_rows:
+        st.dataframe(pd.DataFrame(_bet_rows), hide_index=True, use_container_width=True)
+    else:
+        st.caption("No scored bets yet for this game.")
+
     # ---- Same-Date Historical Comparison — All Games ----
     import datetime as _dt_cmp
     _cmp_today = _dt_cmp.date.today()
@@ -2092,7 +2194,7 @@ elif page == "Probability & AI":
     _cmp_day_num = _cmp_today.day
 
     st.markdown("---")
-    st.subheader(f"📅 On This Day — {_cmp_month_name} {_cmp_day_num}, All Years & {game_cfg.name}")
+    st.subheader(f"Background · 📅 On This Day — {_cmp_month_name} {_cmp_day_num}, All Years & {game_cfg.name}")
     st.caption(
         "Actual winning numbers drawn on this calendar date in every year since this game started. "
         + ("Numbers in the current AI combination are highlighted **orange**."
@@ -2341,10 +2443,11 @@ elif page == "Backtest":
     import plotly.express as _px
     from src.lotto.backtest import run_backtest
 
-    st.title("🔁 Strategy Backtest")
+    st.title("🔁 Money Backtest (random tickets)")
     st.caption(
-        "Simulates the composite-score strategy against every historical draw. "
-        "A net loss is expected — lotto draws are independent random events."
+        "Plays one uniform random ticket per historical draw and tallies the prize money against "
+        "the ticket price: the cost-of-playing baseline. It does not test the standard recipe; "
+        "the Strategy Arena does that, in matches per ticket."
     )
 
     _b_game = game_selector("Game")
@@ -2407,13 +2510,10 @@ elif page == "Backtest":
 # Page: Strategy Arena
 # ===========================================================================
 elif page == "Strategy Arena":
-    import datetime as _dt_arena
-    import secrets
     import plotly.express as _px
     from src.lotto.azure_ai import AzureAIClient
     from src.lotto.arena import (
         STRATEGY_LABELS as _ARENA_LABELS, available_strategies as _arena_available,
-        next_draw_tickets as _arena_next,
         run_arena as _run_arena,
     )
     from src.lotto.crowd import crowd_games as _crowd_games, fit_crowd_model as _fit_crowd
@@ -2424,7 +2524,8 @@ elif page == "Strategy Arena":
 
     st.title("🏟️ Strategy Arena")
     st.caption(
-        "Every strategy generates tickets for each past draw using only the draws before it. "
+        "The scoreboard: it does not make your tickets, it measures the standard recipe (Hybrid) "
+        "against the alternatives. Every strategy generates tickets for each past draw using only the draws before it. "
         "Average matches are tested against the exact random expectation, with p-values adjusted "
         "for the number of strategies compared. Crowd-aware strategies also report how much of a "
         "jackpot they would keep if they won."
@@ -2500,7 +2601,6 @@ elif page == "Strategy Arena":
             st.caption("AI analysis is unavailable until Azure AI is configured.")
         else:
             if st.button("🤖 AI analysis of these results", key="arena_ai"):
-                _a_next = st.session_state.get("arena_next")
                 with st.spinner("AI is reading the arena results…"):
                     try:
                         st.session_state[_a_ai_key] = {
@@ -2518,8 +2618,6 @@ elif page == "Strategy Arena":
                                     if _a_has_crowd else None
                                 ),
                                 bet_history=load_bet_history(_a_game),
-                                next_tickets=(_a_next["tickets"]
-                                              if _a_next and _a_next["game"] == _a_game else None),
                             ),
                             "prompt": _a_ai_client.last_prompt,
                         }
@@ -2547,182 +2645,11 @@ elif page == "Strategy Arena":
         )
 
     st.markdown("---")
-    st.subheader("🎟️ Tickets for the next draw")
-    import src.lotto.lucky as _lucky_mod
-    from src.lotto.arena import next_draw_hybrid_tickets as _arena_next_hybrid
-    from src.lotto.lucky import (
-        day_profile as _day_profile, default_ml_count as _default_ml_count,
-        next_draw_date as _next_draw_date, parse_extra_numbers as _parse_extra,
+    st.info(
+        "🎟️ **Tickets are made on the Make Tickets page**, the one standard way (half ML scores, "
+        "half lucky numbers). This page only measures how that recipe, called *Hybrid* above, compares "
+        "with the alternatives."
     )
-    _n1, _n2, _n3 = st.columns(3)
-    with _n1:
-        _n_strategy = st.selectbox(
-            "Strategy", _a_options, format_func=lambda k: _ARENA_LABELS[k],
-            index=_a_options.index("hybrid") if "hybrid" in _a_options else 0,
-            key="arena_next_strategy",
-        )
-    with _n2:
-        _n_count = st.slider("Tickets", 1, 20, 5, key="arena_next_count")
-    with _n3:
-        _n_date = st.date_input(
-            "Draw date", value=_next_draw_date(_a_cfg), min_value=_dt_arena.date.today(),
-            format="YYYY-MM-DD", key="arena_bet_date",
-            help="Lucky numbers are scored for this date; saved bets use it too.",
-        )
-    _n_birth, _n_extra, _n_ml_count = None, [], _default_ml_count(_a_cfg)
-    _n_ai_numbers = {}
-    if _n_strategy in ("lucky", "hybrid"):
-        _p = _day_profile(_n_date)
-        st.caption(
-            f"🧧 {_n_date.isoformat()} ({_p['weekday']}): {_p['day_pillar']} {_p['day_element']} "
-            f"{_p['day_animal']} day · {_p['year_pillar']} {_p['year_animal']} year, flying star "
-            f"{_p['year_star']} · {_p['sun_sign']} · universal day {_p['universal_day']} · "
-            f"moon-age day ≈ {_p['moon_age_day']}"
-        )
-        with st.expander("Lucky-number inputs (optional)"):
-            _l1, _l2, _l3 = st.columns(3)
-            with _l1:
-                _n_birth = st.date_input(
-                    "Your birth date", value=None, min_value=_dt_arena.date(1900, 1, 1),
-                    max_value=_dt_arena.date.today(), format="YYYY-MM-DD", key="arena_birthdate",
-                )
-            with _l2:
-                _extra_text = st.text_input(
-                    "Your own lucky numbers", key=f"arena_extra_{_a_game}", placeholder="e.g. 7, 23, 41",
-                )
-                _n_extra = _parse_extra(_extra_text, _a_cfg)
-            _n_ai_key = f"arena_ai_lucky_{_a_game}_{_n_date.isoformat()}"
-            _n_ai_client = AzureAIClient()
-            if _n_ai_client.is_configured():
-                _nb1, _nb2 = st.columns([2, 1])
-                if _nb1.button("🤖 Ask AI for lucky numbers of this date", key="arena_ai_lucky_btn"):
-                    try:
-                        with st.spinner("Asking the AI for lucky numbers…"):
-                            st.session_state[_n_ai_key] = _lucky_mod.ask_ai_lucky_numbers(
-                                _n_ai_client, _a_cfg, _n_date, _n_birth)
-                    except Exception as _n_ai_exc:
-                        st.error(f"Azure AI error: {_n_ai_exc}")
-                if _nb2.button("Clear AI numbers", key="arena_ai_lucky_clear"):
-                    st.session_state.pop(_n_ai_key, None)
-            _n_ai_numbers = st.session_state.get(_n_ai_key, {})
-            if _n_ai_numbers:
-                st.caption(
-                    "🤖 AI lucky numbers (no live web access; answered from training knowledge using the "
-                    "calendar facts computed here): "
-                    + ", ".join(f"**{n:02d}**" for n in _n_ai_numbers) + ". "
-                    + " ".join(f"{n:02d}: {why}" for n, why in _n_ai_numbers.items())
-                )
-            if _n_strategy == "hybrid":
-                with _l3:
-                    _n_ml_count = st.slider(
-                        "Numbers taken from ML", 0, _a_cfg.picks, _default_ml_count(_a_cfg),
-                        key=f"arena_ml_count_{_a_game}",
-                    )
-    if st.button("Generate tickets", key="arena_next_go"):
-        _n_seed = secrets.randbelow(2**31)
-        try:
-            _n_halves = None
-            if _n_strategy == "hybrid":
-                _n_halves = _arena_next_hybrid(
-                    _a_df, _a_cfg, n=_n_count, draw_time=_a_dt, seed=_n_seed, draw_date=_n_date,
-                    ml_count=_n_ml_count, birthdate=_n_birth, extra_numbers=_n_extra,
-                    ai_numbers=_n_ai_numbers,
-                )
-                _n_tickets = [h["numbers"] for h in _n_halves]
-            else:
-                _n_tickets = _arena_next(
-                    _a_df, _a_cfg, _n_strategy, n=_n_count, draw_time=_a_dt, crowd=_a_crowd,
-                    seed=_n_seed, draw_date=_n_date, birthdate=_n_birth, extra_numbers=_n_extra,
-                    ai_numbers=_n_ai_numbers,
-                )
-            st.session_state["arena_next"] = {
-                "game": _a_game, "draw_time": _a_dt, "strategy": _n_strategy, "seed": _n_seed,
-                "draw_date": _n_date, "tickets": _n_tickets, "halves": _n_halves,
-                "birthdate": _n_birth, "extra_numbers": _n_extra, "ai_numbers": _n_ai_numbers,
-            }
-        except Exception as _n_exc:
-            st.error(f"Could not generate tickets: {_n_exc}")
-    _n_state = st.session_state.get("arena_next")
-    # Tickets made before the draw date was stored (older session) are stale: regenerate.
-    if _n_state and _n_state["game"] == _a_game and "draw_date" in _n_state:
-        _n_rows = []
-        for _i, _t in enumerate(_n_state["tickets"]):
-            _row = {"ticket": " - ".join(f"{v:02d}" for v in _t)}
-            if _n_state.get("halves"):
-                _half = _n_state["halves"][_i]
-                _row["🤖 ML numbers"] = " - ".join(f"{v:02d}" for v in _half["ml"])
-                _row["🧧 Lucky numbers"] = " - ".join(f"{v:02d}" for v in _half["lucky"])
-            if _a_has_crowd:
-                _arr = np.array([_t])
-                _row["crowd index (1.0 = average)"] = float(_a_crowd.crowd_index(_arr, _a_game)[0])
-                _row["jackpot share kept if won"] = float(_a_crowd.share_factor(_arr, _a_game)[0])
-            _n_rows.append(_row)
-        st.dataframe(pd.DataFrame(_n_rows), hide_index=True, use_container_width=True)
-        st.caption(
-            f"Tickets for the {_n_state['draw_date'].isoformat()} draw. Sampling seed "
-            f"{_n_state.get('seed')}: every click draws a fresh set from the strategy's weights; "
-            "the same seed reproduces the same tickets."
-            + (" 🤖 = numbers from the ML scores, 🧧 = lucky numbers of the draw date; ticket #1 "
-               "uses the strongest of each." if _n_state.get("halves") else "")
-        )
-        if _n_state["strategy"] in ("hybrid", "lucky"):
-            from src.lotto.lucky import lucky_scores as _lucky_scores
-            _lk = _lucky_scores(_a_cfg, _n_state["draw_date"], birthdate=_n_state.get("birthdate"),
-                                extra_numbers=_n_state.get("extra_numbers") or (),
-                                ai_numbers=_n_state.get("ai_numbers") or None)
-            _lk_score = dict(zip(_lk.numbers, _lk.scores))
-            _base = (1 if _a_cfg.ordered else _a_cfg.picks) / (_a_cfg.pool - _a_cfg.low_boundary + 1)
-            _why_rows = []
-            for _i, _t in enumerate(_n_state["tickets"], 1):
-                _half = _n_state["halves"][_i - 1] if _n_state.get("halves") else None
-                _ml_pairs = list(zip(_half["ml"], _half["ml_scores"])) if _half else []
-                _lucky_nums = list(_half["lucky"]) if _half else list(_t)
-                for _num, _sc in _ml_pairs:
-                    _why_rows.append({
-                        "ticket": _i, "number": f"{_num:02d}", "from": "🤖 ML",
-                        "why": f"ML score {_sc:.4f} (random baseline {_base:.4f}); "
-                               "learned from draw history, not odds",
-                    })
-                for _num in _lucky_nums:
-                    _why_rows.append({
-                        "ticket": _i, "number": f"{_num:02d}", "from": "🧧 Lucky",
-                        "why": f"lucky score {_lk_score.get(_num, 0.0):.1f}: "
-                               + ("; ".join(_lk.reasons.get(_num, [])) or "no source endorses it"),
-                    })
-            with st.expander("🔎 Where each number comes from", expanded=True):
-                st.dataframe(pd.DataFrame(_why_rows), hide_index=True, use_container_width=True)
-                st.caption(
-                    "🤖 ML numbers are scored by the logistic model from past draws. 🧧 Lucky numbers add "
-                    "up every source that endorses them for the draw date (feng shui day element and "
-                    "animal, auspicious digits, flying star, numerology, birth date, your own numbers); "
-                    "digits containing 4 are discounted. Lucky sources are traditions, not statistics. "
-                    "Ticket #1 takes the top-scoring numbers of each kind, the others are sampled."
-                )
-        if _n_state["draw_date"] != _n_date:
-            st.warning("The draw date changed after these tickets were made. Click Generate tickets "
-                       "again so the lucky numbers match the date you will bet on.")
-        if st.button("🎯 Save these tickets as bets", key="arena_save"):
-            try:
-                _conn_ar = get_connection()
-                for _i, _t in enumerate(_n_state["tickets"]):
-                    _why = f"Strategy Arena: {_ARENA_LABELS[_n_state['strategy']]}"
-                    if _n_state.get("halves"):
-                        _half = _n_state["halves"][_i]
-                        _why += f" — ML {_half['ml']} + lucky {_half['lucky']} for {_n_state['draw_date']}"
-                    _conn_ar.execute(
-                        """INSERT INTO saved_combinations
-                           (id, saved_at, game, draw_time, combination, reasoning,
-                            label, source, bet_date, status, ml_run_id)
-                           VALUES (nextval('saved_combinations_seq'), NOW(),
-                                   ?, ?, ?, ?, ?, 'bet', ?, 'pending', NULL)""",
-                        [_a_game, _n_state["draw_time"] if len(_a_cfg.draw_times) > 1 else None,
-                         "-".join(f"{v:02d}" for v in _t), _why,
-                         f"arena_{_n_state['strategy']}", _n_state["draw_date"]],
-                    )
-                _conn_ar.close()
-                st.toast(f"Saved {len(_n_state['tickets'])} bets", icon="🎯")
-            except Exception as _sv_exc:
-                st.error(f"Save failed: {_sv_exc}")
 
 
 # ===========================================================================
@@ -3285,7 +3212,7 @@ elif page == "Saved Combos":
 
     st.title("🎯 My Bets")
     st.caption(
-        "AI-generated combinations you saved as bets from the **Probability & AI** page. "
+        "AI-generated combinations you saved as bets from the **Make Tickets** page. "
         "Track status, check results against actual draws, and manage your bet history."
     )
 
@@ -3363,7 +3290,7 @@ elif page == "Saved Combos":
     if _bets_all.empty:
         st.info(
             "No bets saved yet.  \n"
-            "Go to **Probability & AI**, run an AI analysis, "
+            "Go to **Make Tickets**, generate your tickets, "
             "then click **🎯 Save as Bet**."
         )
     else:

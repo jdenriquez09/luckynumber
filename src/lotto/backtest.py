@@ -47,7 +47,10 @@ def run_backtest(
     max_rows: int = 200,
 ) -> dict:
     """
-    Simulate a composite-score betting strategy against all historical draws.
+    Simulate playing one uniform random ticket per historical draw, with prize money tallied.
+
+    suggest_combinations is a uniform sampler: this is the cost-of-playing baseline, not a
+    test of any scoring strategy (the Strategy Arena tests those).
 
     Parameters
     ----------

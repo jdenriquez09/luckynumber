@@ -87,25 +87,18 @@ def test_arena_page_runs_strategies_and_shows_crowd_model(arena_app):
     assert any("strategy" in i.value.lower() or "random" in i.value.lower() for i in app.info)
 
 
-def test_arena_page_next_tickets_show_crowding_and_save_bets(arena_app):
+def test_arena_page_is_the_scoreboard_and_points_to_the_one_ticket_generator(arena_app):
     app, conn = arena_app
     app.run()
-    app.selectbox(key="arena_next_strategy").set_value("crowd")
-    app.slider(key="arena_next_count").set_value(3)
-    app.button(key="arena_next_go").click().run()
-    assert not app.exception and not app.error, [e.value for e in app.error]
-    shown = next(d.value for d in app.dataframe if "ticket" in d.value.columns)
-    assert len(shown) == 3
-    assert (shown["crowd index (1.0 = average)"] < 1).all()
-    assert (shown["jackpot share kept if won"] > 0).all()
-    app.button(key="arena_save").click().run()
     assert not app.exception and not app.error
-    inserts = [c for c in conn.execute.call_args_list if "INSERT INTO saved_combinations" in c.args[0]]
-    assert len(inserts) == 3
-    params = inserts[0].args[1]
-    assert params[0] == "655" and params[1] is None
-    assert params[3] == "Strategy Arena: Crowd-avoiding random"
-    conn.close.assert_called_once()
+    keys = {b.key for b in app.button}
+    assert not keys & {"arena_next_go", "arena_save", "arena_ai_pick"}  # no second ticket generator
+    assert not any("Tickets for the next draw" in s.value for s in app.subheader)
+    assert any("Tickets are made on the Make Tickets page" in i.value for i in app.info)
+    assert any("scoreboard" in c.value for c in app.caption)
+    options = app.multiselect[0].options
+    assert {"hybrid", "lucky", "ml", "uniform"} <= set(options) or "Hybrid" in " ".join(map(str, options))
+    conn.execute.assert_not_called()
 
 
 def test_arena_page_ai_analysis_button(arena_app, monkeypatch):
@@ -143,115 +136,3 @@ def test_arena_page_ai_analysis_button(arena_app, monkeypatch):
     app.run()  # the stored analysis survives a rerun without a second request
     sdk.chat.completions.create.assert_called_once()
     assert any(i.value == "VERDICT: offline analysis text" for i in app.info)
-
-
-def test_arena_page_next_tickets_default_to_hybrid_ml_plus_lucky_and_save_both_halves(arena_app):
-    import datetime as dt
-    from src.lotto.lucky import next_draw_date
-
-    app, conn = arena_app
-    app.run()
-    assert not app.exception and not app.error
-    assert app.selectbox(key="arena_next_strategy").value == "hybrid"
-    assert not any(b.key == "arena_ai_pick" for b in app.button)  # one way to generate tickets
-    assert app.date_input(key="arena_bet_date").value == next_draw_date(GAMES["655"])
-    app.date_input(key="arena_bet_date").set_value(dt.date(2026, 10, 9))
-    app.slider(key="arena_next_count").set_value(4)
-    app.button(key="arena_next_go").click().run()
-    assert not app.exception and not app.error, [e.value for e in app.error]
-    state = app.session_state["arena_next"]
-    assert state["strategy"] == "hybrid" and state["draw_date"] == dt.date(2026, 10, 9)
-    assert len(state["halves"]) == 4
-    for half, ticket in zip(state["halves"], state["tickets"]):
-        assert (len(half["ml"]), len(half["lucky"])) == (3, 3)
-        assert sorted(half["ml"] + half["lucky"]) == ticket
-    shown = next(d.value for d in app.dataframe if "ticket" in d.value.columns)
-    assert {"🤖 ML numbers", "🧧 Lucky numbers"} <= set(shown.columns) and len(shown) == 4
-    assert any("Bing-Chen" in c.value for c in app.caption)  # lucky profile of the chosen date
-    why = next(d.value for d in app.dataframe if "why" in d.value.columns)
-    assert len(why) == 4 * 6 and set(why["from"]) == {"🤖 ML", "🧧 Lucky"}
-    assert set(why[why["ticket"] == 1]["number"]) == {f"{v:02d}" for v in state["tickets"][0]}
-    assert why[why["from"] == "🤖 ML"]["why"].str.startswith("ML score").all()
-    assert why[why["from"] == "🧧 Lucky"]["why"].str.startswith("lucky score").all()
-    assert any("Where each number comes from" in e.label for e in app.expander)
-    app.button(key="arena_save").click().run()
-    inserts = [c for c in conn.execute.call_args_list if "INSERT INTO saved_combinations" in c.args[0]]
-    assert len(inserts) == 4
-    params = inserts[0].args[1]
-    half = state["halves"][0]
-    assert params[3] == (f"Strategy Arena: Hybrid (half ML, half lucky numbers) — "
-                         f"ML {half['ml']} + lucky {half['lucky']} for 2026-10-09")
-    assert params[5] == dt.date(2026, 10, 9)
-
-
-def test_arena_page_warns_when_the_draw_date_changes_after_generating(arena_app):
-    import datetime as dt
-
-    app, _ = arena_app
-    app.run()
-    app.button(key="arena_next_go").click().run()
-    assert not any("draw date changed" in w.value for w in app.warning)
-    app.date_input(key="arena_bet_date").set_value(dt.date(2027, 1, 5))
-    app.run()
-    assert any("draw date changed" in w.value for w in app.warning)
-
-
-def test_arena_page_each_click_draws_fresh_tickets_with_a_visible_seed(arena_app):
-    app, _ = arena_app
-    app.run()
-    app.selectbox(key="arena_next_strategy").set_value("hot")
-    app.button(key="arena_next_go").click().run()
-    assert not app.exception and not app.error
-    first = app.session_state["arena_next"]
-    app.button(key="arena_next_go").click().run()
-    second = app.session_state["arena_next"]
-    assert first["seed"] != second["seed"] and first["tickets"] != second["tickets"]
-    assert any(f"Sampling seed {second['seed']}" in c.value for c in app.caption)
-
-
-def test_arena_page_ignores_tickets_saved_by_an_older_session(arena_app):
-    app, _ = arena_app
-    # Shape written before the draw date and halves were stored, including the removed AI mode.
-    app.session_state["arena_next"] = {"game": "655", "draw_time": "21:00", "strategy": "ai_curated",
-                                       "seed": 1, "tickets": [[1, 2, 3, 4, 5, 6]]}
-    app.run()
-    assert not app.exception and not app.error
-    assert not any(b.key == "arena_save" for b in app.button)
-    app.button(key="arena_next_go").click().run()
-    assert not app.exception and any(b.key == "arena_save" for b in app.button)
-
-
-def test_arena_page_asks_the_ai_for_lucky_numbers_and_uses_them(arena_app, monkeypatch):
-    import datetime as dt
-    import json
-    from types import SimpleNamespace
-    from src.lotto.azure_ai import AzureAIClient
-
-    app, _ = arena_app
-    for name, value in {"AZURE_OPENAI_ENDPOINT": "https://offline.invalid",
-                        "AZURE_OPENAI_API_KEY": "offline-test-only",
-                        "AZURE_OPENAI_DEPLOYMENT": "offline-test"}.items():
-        monkeypatch.setenv(name, value)
-    sdk = Mock()
-    suggested = {n: f"reason for {n}" for n in (5, 10, 15, 20, 25, 30)}
-    sdk.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(
-        finish_reason="stop", message=SimpleNamespace(content=json.dumps(
-            {"numbers": [{"number": n, "reason": why} for n, why in suggested.items()]})))])
-    monkeypatch.setattr(AzureAIClient, "_client", Mock(return_value=sdk))
-    app.run()
-    app.date_input(key="arena_bet_date").set_value(dt.date(2026, 10, 9))
-    app.run()
-    app.button(key="arena_ai_lucky_btn").click().run()
-    assert not app.exception and not app.error, [e.value for e in app.error]
-    sdk.chat.completions.create.assert_called_once()
-    assert "Bing-Chen" in sdk.chat.completions.create.call_args.kwargs["messages"][0]["content"]
-    assert any("AI lucky numbers" in c.value and "05" in c.value for c in app.caption)
-    app.slider(key="arena_next_count").set_value(2)
-    app.button(key="arena_next_go").click().run()
-    assert not app.exception and not app.error
-    state = app.session_state["arena_next"]
-    assert state["ai_numbers"] == suggested
-    why = next(d.value for d in app.dataframe if "why" in d.value.columns)
-    assert why["why"].str.contains("AI suggestion: reason for").any()  # the AI numbers reach the tickets
-    app.button(key="arena_ai_lucky_clear").click().run()
-    assert not any("AI lucky numbers" in c.value for c in app.caption)

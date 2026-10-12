@@ -195,7 +195,7 @@ def test_arena_validates_inputs(crowd_model):
     assert "crowd" not in arena.available_strategies(GAMES["655"], None)
 
 
-@pytest.mark.parametrize("strategy", ["uniform", "hot", "overdue", "ml", "lucky", "hybrid", "crowd", "ml_crowd"])
+@pytest.mark.parametrize("strategy", ["uniform", "hot", "overdue", "ml", "crowd", "ml_crowd"])
 def test_next_draw_tickets_are_valid_for_every_strategy(crowd_model, strategy):
     cfg = GAMES["655"]
     frame = _crowded_frames(draws=260)["655"]

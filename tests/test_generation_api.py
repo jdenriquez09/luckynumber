@@ -59,7 +59,7 @@ def test_probability_route_reaches_endpoint(client, monkeypatch):
     monkeypatch.setattr(routes.lean_ml, "generate_ml_combinations", generate)
     monkeypatch.setattr(routes.pred, "heat_map_summary", Mock(return_value="History only"))
 
-    response = client.get("/analysis/655/probability?window=2&n_suggestions=1&draw_time=21:00")
+    response = client.get("/analysis/655/probability?method=ml&window=2&n_suggestions=1&draw_time=21:00")
 
     assert response.status_code == 200
     assert response.json()["suggestions"] == [[1, 2, 3, 4, 5, 6]]
@@ -193,7 +193,7 @@ def grounded_ai(monkeypatch):
 
 
 @pytest.mark.parametrize("game_id", ["655", "3d"])
-def test_ml_default_ai_explains_exact_probability_ticket(client, monkeypatch, grounded_ai, game_id):
+def test_ml_method_ai_explains_exact_probability_ticket(client, monkeypatch, grounded_ai, game_id):
     cfg = GAMES[game_id]
     chosen = [9, 0, 9] if cfg.ordered else [6, 5, 4, 3, 2, 1]
     frame = draws(game_id, [(dt, chosen) for dt in cfg.draw_times] * 3)
@@ -205,8 +205,8 @@ def test_ml_default_ai_explains_exact_probability_ticket(client, monkeypatch, gr
     for name in ("freq_chi_square", "gap_analysis", "digit_uniformity", "digit_repeat_rate"):
         monkeypatch.setattr(routes.an, name, Mock(return_value=SimpleNamespace(conclusion=name)))
 
-    probability = client.get(f"/analysis/{game_id}/probability?draw_time=21:00&window=1")
-    response = client.post(f"/analysis/{game_id}/ai_summary", json={"window": 1})
+    probability = client.get(f"/analysis/{game_id}/probability?method=ml&draw_time=21:00&window=1")
+    response = client.post(f"/analysis/{game_id}/ai_summary", json={"window": 1, "method": "ml"})
 
     assert probability.status_code == response.status_code == 200, response.text
     assert probability.json()["suggestions"] == generation["combinations"]
@@ -244,7 +244,7 @@ def test_multi_slot_ml_never_pools_training(client, monkeypatch, ai, endpoint):
         monkeypatch.setattr(routes.an, name, Mock(return_value=SimpleNamespace(conclusion=name)))
 
     if endpoint == "probability":
-        response = client.get("/analysis/3d/probability?n_suggestions=2")
+        response = client.get("/analysis/3d/probability?method=ml&n_suggestions=2")
         assert response.status_code == 200, response.text
         payload = response.json()
         assert payload["suggestions"] == []
@@ -252,7 +252,7 @@ def test_multi_slot_ml_never_pools_training(client, monkeypatch, ai, endpoint):
         assert list(payload["by_draw_time"]) == list(times)
         generations = list(payload["by_draw_time"].values())
     else:
-        response = client.post("/analysis/3d/ai_summary", json={"n_suggestions": 2})
+        response = client.post("/analysis/3d/ai_summary", json={"n_suggestions": 2, "method": "ml"})
         assert response.status_code == 200, response.text
         generations = [slot["generation"] for slot in ai.interpret_lotto_stats.call_args.kwargs["slots"]]
     assert [call.kwargs["draw_time"] for call in generate.call_args_list] == list(times)
@@ -407,3 +407,61 @@ def test_generic_analysis_route_still_registered(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["test"] == "freq_chi_square"
     conn.close.assert_called_once()
+
+def test_standard_method_is_the_hybrid_recipe_for_probability_and_ai_summary(client, monkeypatch):
+    frame = pd.DataFrame({"draw_time": ["21:00"]})
+    monkeypatch.setattr(routes, "_load_draws", Mock(return_value=frame))
+    monkeypatch.setattr(routes.pred, "number_heat_map", Mock(return_value=pd.DataFrame()))
+    monkeypatch.setattr(routes.pred, "heat_map_summary", Mock(return_value=""))
+    standard = {"method": "hybrid_ml_lucky", "combinations": [[1, 2, 3, 4, 5, 6]], "tickets": []}
+    generate = Mock(return_value=standard)
+    monkeypatch.setattr(routes.tickets, "generate_tickets", generate)
+    response = client.get("/analysis/655/probability?n_suggestions=1&draw_time=21:00"
+                          "&draw_date=2026-10-09&lucky_numbers=7,23&ml_count=2")
+    assert response.status_code == 200, response.text
+    assert response.json()["generation"] == standard
+    generate.assert_called_once()
+    kwargs = generate.call_args.kwargs
+    assert kwargs["n"] == 1 and kwargs["seed"] == 42 and kwargs["ml_count"] == 2
+    assert str(kwargs["draw_date"]) == "2026-10-09" and kwargs["extra_numbers"] == [7, 23]
+    assert routes.AISummaryRequest().method == "hybrid"
+
+
+def test_probability_ai_lucky_asks_the_ai_once_and_passes_its_shortlist(client, monkeypatch):
+    frame = pd.DataFrame({"draw_time": ["14:00", "17:00", "21:00"]})
+    monkeypatch.setattr(routes, "_load_draws", Mock(return_value=frame))
+    monkeypatch.setattr(routes.pred, "number_heat_map", Mock(return_value=pd.DataFrame()))
+    monkeypatch.setattr(routes.pred, "heat_map_summary", Mock(return_value=""))
+    generate = Mock(return_value={"method": "hybrid_ml_lucky", "combinations": [], "tickets": []})
+    monkeypatch.setattr(routes.tickets, "generate_tickets", generate)
+    ask = Mock(return_value={5: "Earth day", 10: "Ten"})
+    monkeypatch.setattr(routes.lucky, "ask_ai_lucky_numbers", ask)
+    for name, value in {"AZURE_OPENAI_ENDPOINT": "https://offline.invalid", "AZURE_OPENAI_API_KEY": "x",
+                        "AZURE_OPENAI_DEPLOYMENT": "offline"}.items():
+        monkeypatch.setenv(name, value)
+    response = client.get("/analysis/3d/probability?ai_lucky=true&draw_date=2026-10-09&n_suggestions=1")
+    assert response.status_code == 200, response.text
+    ask.assert_called_once()  # once per request, not once per draw slot
+    assert str(ask.call_args.args[2]) == "2026-10-09"
+    assert generate.call_count == 3  # three 3D slots, one shortlist
+    assert all(call.kwargs["ai_numbers"] == {5: "Earth day", 10: "Ten"} for call in generate.call_args_list)
+    generate.reset_mock(); ask.reset_mock()
+    assert client.get("/analysis/3d/probability?n_suggestions=1").status_code == 200
+    ask.assert_not_called()  # opt-in on the API
+    assert all("ai_numbers" not in call.kwargs for call in generate.call_args_list)
+
+
+def test_probability_ai_lucky_reports_missing_or_failing_ai(client, monkeypatch):
+    frame = pd.DataFrame({"draw_time": ["21:00"]})
+    monkeypatch.setattr(routes, "_load_draws", Mock(return_value=frame))
+    monkeypatch.setattr(routes.pred, "number_heat_map", Mock(return_value=pd.DataFrame()))
+    monkeypatch.setattr(routes.pred, "heat_map_summary", Mock(return_value=""))
+    monkeypatch.setattr(routes.tickets, "generate_tickets", Mock())
+    for name in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_DEPLOYMENT"):
+        monkeypatch.delenv(name, raising=False)
+    assert client.get("/analysis/655/probability?ai_lucky=true").status_code == 503
+    for name in ("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_DEPLOYMENT"):
+        monkeypatch.setenv(name, "x")
+    monkeypatch.setattr(routes.lucky, "ask_ai_lucky_numbers", Mock(side_effect=RuntimeError("boom")))
+    failed = client.get("/analysis/655/probability?ai_lucky=true")
+    assert failed.status_code == 502 and "boom" in failed.text

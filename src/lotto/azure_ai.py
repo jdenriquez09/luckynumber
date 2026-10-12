@@ -205,6 +205,7 @@ def _generation_context(generation: dict, pool: list[int], picks: int,
                     for number in lucky_numbers]
         profile = {k: v for k, v in lucky["profile"].items() if k != "date"}
         personal = {k: v for k, v in (lucky.get("personal") or {}).items() if v}
+        shortlist = personal.pop("ai_numbers", [])
         lines.extend([
             "Lucky draw-date profile: " + json.dumps(profile, separators=(",", ":")),
             "Lucky half evidence (score adds up every source that endorses the number; digits "
@@ -212,6 +213,10 @@ def _generation_context(generation: dict, pool: list[int], picks: int,
             + json.dumps(evidence, separators=(",", ":")),
             ("Personal inputs: " + json.dumps(personal, separators=(",", ":"))) if personal
             else "Personal inputs: none supplied.",
+            (f"The lucky half was drawn from this shortlist of lucky numbers suggested by an AI for the "
+             f"draw date: {shortlist}. The date rules ranked them; the reasons above say which sources "
+             "endorse each number.") if shortlist else
+            "The lucky half comes from the date rules alone (no AI shortlist).",
             "Lucky sources are traditional conventions applied to the draw date, not statistics: "
             "they come with no evaluation and no demonstrated predictive power. Explain which "
             "supplied sources endorse each lucky number and invent no others.",

@@ -43,8 +43,13 @@ ROOT_ELEMENT = {1: "Water", 2: "Earth", 3: "Wood", 4: "Wood", 5: "Earth",
                 6: "Metal", 7: "Metal", 8: "Earth", 9: "Fire"}
 PRODUCES = {"Wood": "Fire", "Fire": "Earth", "Earth": "Metal", "Metal": "Water", "Water": "Wood"}
 MOTHER = {child: parent for parent, child in PRODUCES.items()}
+# He Tu: the numbers (last digits) that belong to each element.
+HE_TU_DIGITS = {"Water": (1, 6), "Fire": (2, 7), "Wood": (3, 8), "Metal": (4, 9), "Earth": (5, 0)}
 # Auspicious digits by sound: 8 fa/prosper, 6 liu/smooth, 9 jiu/lasting, 2 easy, 3 life, 1 first.
-AUSPICIOUS_DIGITS = {8: 0.9, 6: 0.6, 9: 0.6, 2: 0.3, 3: 0.3, 1: 0.2}
+# These never change with the date, so they only break ties between numbers the date already favours.
+AUSPICIOUS_DIGITS = {8: 0.3, 6: 0.2, 9: 0.2, 2: 0.1, 3: 0.1, 1: 0.05}
+AUSPICIOUS_CAP = 0.5
+YEAR_STAR_WEIGHT = 0.25  # the flying star is constant for a whole Chinese year
 TABOO_FACTOR = 0.6  # per digit 4 ("death" sound), applied to the Chinese score only
 # Chaldean / Vedic planet numbers: Sun 1, Moon 2, Jupiter 3, Mercury 5, Venus 6, Saturn 8, Mars 9.
 WEEKDAY_NUMBER = (2, 9, 5, 3, 6, 8, 1)  # Monday .. Sunday
@@ -59,6 +64,7 @@ NEW_MOON_JD = 2451550.26  # 2000-01-06 18:14 UTC
 BASE_WEIGHT = 0.3  # floor added to every score before sampling
 EXTRA_NUMBER_WEIGHT = 2.0
 AI_NUMBER_WEIGHT = 1.5  # numbers the AI suggested for the draw date
+OFF_SHORTLIST_FACTOR = 1e-9  # with an AI shortlist, other numbers only fill gaps (ranked by the date rules)
 _WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
@@ -91,6 +97,7 @@ def day_profile(d: dt.date) -> dict:
     return {
         "date": d.isoformat(), "weekday": _WEEKDAYS[d.weekday()],
         "day_pillar": f"{STEMS[stem]}-{BRANCHES[branch]}",
+        "day_stem_number": stem + 1, "day_branch_number": branch + 1,
         "day_element": element, "day_mother_element": MOTHER[element],
         "day_animal": ANIMALS[branch],
         "chinese_year": year, "year_pillar": f"{STEMS[(year - 4) % 10]}-{BRANCHES[(year - 4) % 12]}",
@@ -111,6 +118,7 @@ class LuckyScores:
     reasons: dict[int, list[str]]
     profile: dict
     personal: dict = field(default_factory=dict)
+    boosted: np.ndarray | None = None  # AI shortlist (+ own numbers); the lucky half is drawn from it
 
     def top(self, k: int = 12) -> list[dict]:
         order = sorted(range(len(self.numbers)), key=lambda i: (-self.scores[i], self.numbers[i]))
@@ -145,25 +153,34 @@ def lucky_scores(cfg: GameConfig, draw_date: dt.date, *, birthdate: dt.date | No
         elif element == prof["day_mother_element"]:
             chinese[i] += 0.6
             why.append(f"{element} feeds the {prof['day_element']} day")
+        if n % 10 in HE_TU_DIGITS[prof["day_element"]]:
+            chinese[i] += 0.7
+            why.append(f"He Tu number of {prof['day_element']}")
+        if n == prof["day_stem_number"]:
+            chinese[i] += 0.8
+            why.append(f"day stem {prof['day_pillar'].split('-')[0]} = {n}")
+        if n == prof["day_branch_number"]:
+            chinese[i] += 0.8
+            why.append(f"day branch {prof['day_pillar'].split('-')[1]} = {n}")
         if digits & animal_digits:
             chinese[i] += 0.8
             why.append(f"{prof['day_animal']} day digit")
         lucky_digits = [c for c in str(n) if int(c) in AUSPICIOUS_DIGITS]
         if lucky_digits:
-            chinese[i] += min(sum(AUSPICIOUS_DIGITS[int(c)] for c in lucky_digits), 1.5)
+            chinese[i] += min(sum(AUSPICIOUS_DIGITS[int(c)] for c in lucky_digits), AUSPICIOUS_CAP)
             why.append("auspicious digits " + "".join(lucky_digits))
         if prof["year_star"] in digits:
-            chinese[i] += 0.7
+            chinese[i] += YEAR_STAR_WEIGHT
             why.append(f"flying star {prof['year_star']}")
         fours = str(n).count("4")
         if fours and chinese[i] > 0:
             chinese[i] *= TABOO_FACTOR ** fours
             why.append("contains 4 (taboo)")
         if root == prof["weekday_number"]:
-            western[i] += 0.6
+            western[i] += 0.8
             why.append(f"{prof['weekday']} planet number {prof['weekday_number']}")
         if prof["sign_number"] in digits:
-            western[i] += 0.5
+            western[i] += 0.4
             why.append(f"{prof['sun_sign']} ruler number {prof['sign_number']}")
         if n == draw_date.day:
             western[i] += 1.0
@@ -172,7 +189,7 @@ def lucky_scores(cfg: GameConfig, draw_date: dt.date, *, birthdate: dt.date | No
             western[i] += 0.7
             why.append(f"universal day {prof['universal_day']}")
         if n == prof["moon_age_day"]:
-            western[i] += 0.8
+            western[i] += 1.0
             why.append("moon-age day")
         if birthdate and n in (birthdate.day, birthdate.month):
             personal[i] += 1.0
@@ -186,11 +203,14 @@ def lucky_scores(cfg: GameConfig, draw_date: dt.date, *, birthdate: dt.date | No
         if ai_numbers and n in ai_numbers:
             extra[i] += AI_NUMBER_WEIGHT
             why.append(f"AI suggestion: {ai_numbers[n]}")
+    shortlist = {n for n in (ai_numbers or {}) if n in reasons}
+    boosted = (np.array([n in shortlist or n in extra_numbers for n in numbers]) if shortlist else None)
     return LuckyScores(
         numbers, chinese + western + personal + extra, reasons, prof,
         {"birthdate": birthdate.isoformat() if birthdate else None, "life_path": life_path,
          "extra_numbers": [n for n in extra_numbers if n in reasons],
          "ai_numbers": [n for n in (ai_numbers or {}) if n in reasons]},
+        boosted,
     )
 
 
@@ -260,7 +280,10 @@ def _best(weights: np.ndarray, k: int, blocked: set[int]) -> list[int]:
 
 
 def _lucky_weights(lucky: LuckyScores) -> np.ndarray:
-    return BASE_WEIGHT + lucky.scores
+    weights = BASE_WEIGHT + lucky.scores
+    if lucky.boosted is not None:  # AI shortlist: draw from it first, the date rules fill any gap
+        weights = np.where(lucky.boosted, weights, weights * OFF_SHORTLIST_FACTOR)
+    return weights
 
 
 def build_hybrid_tickets(cfg: GameConfig, ml_weights: np.ndarray, lucky: LuckyScores, n: int,
@@ -328,8 +351,9 @@ def hybrid_generation(
     slot = int(draw_time[:2]) if draw_time else 0
     rng = np.random.default_rng([seed, draw_date.toordinal(), slot])
     tickets = build_hybrid_tickets(cfg, scores_to_weights(cfg, ml["scores"]), lucky, n, ml_count, rng)
-    return {
+    result = {
         "method": "hybrid_ml_lucky", "ml_method": ml["method"],
+        "lucky_source": "ai_shortlist+date_rules" if ai_numbers else "date_rules",
         "combinations": [t["numbers"] for t in tickets], "tickets": tickets,
         "ml_count": ml_count, "lucky_count": cfg.picks - ml_count, "draw_date": draw_date.isoformat(),
         "lucky": lucky.to_dict(), "scores": ml["scores"], "feature_weights": ml["feature_weights"],
@@ -337,3 +361,6 @@ def hybrid_generation(
         "reason": (f"{ml_count} numbers from ML scores + {cfg.picks - ml_count} lucky numbers for "
                    f"{draw_date.isoformat()}. ML half: {ml['reason']}"),
     }
+    if ml.get("bet_feedback_numbers"):  # the ML scores were rescaled by the user's scored bets
+        result["bet_feedback_numbers"] = ml["bet_feedback_numbers"]
+    return result

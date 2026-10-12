@@ -12,6 +12,7 @@ import src.lotto.analysis as an
 import src.lotto.predict as pred
 import src.lotto.lean_ml as lean_ml
 import src.lotto.lucky as lucky
+import src.lotto.tickets as tickets
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
@@ -56,8 +57,8 @@ def _load_draws(game_cfg) -> "pd.DataFrame":
 
 def _generate(df, game_cfg, *, method, n, window, draw_time, hybrid=None) -> dict:
     """Use the same seeded local generation for displayed tickets and AI context."""
-    if method == "hybrid":
-        return lucky.hybrid_generation(
+    if method == "hybrid":  # the standard recipe: half ML, half lucky numbers
+        return tickets.generate_tickets(
             df, game_cfg, n=n, window=window, draw_time=draw_time, seed=42, **(hybrid or {}),
         )
     if method == "ml":
@@ -76,18 +77,34 @@ def _generate(df, game_cfg, *, method, n, window, draw_time, hybrid=None) -> dic
     }
 
 
+def _ai_lucky_numbers(game_cfg, draw_date, birthdate) -> dict[int, str]:
+    """The AI's lucky-number shortlist for one draw date (asked once per request)."""
+    from src.lotto.azure_ai import AzureAIClient
+
+    client = AzureAIClient()
+    if not client.is_configured():
+        raise HTTPException(503, client.setup_instructions())
+    try:
+        return lucky.ask_ai_lucky_numbers(client, game_cfg, draw_date, birthdate)
+    except Exception as exc:
+        raise HTTPException(502, f"Azure AI could not provide lucky numbers: {exc}")
+
+
 @router.get("/{game_id}/probability")
 def get_probability(
     game_id: str,
     window: int | None = Query(default=None, gt=0, description="Limit to last N draws; omit for all"),
     n_suggestions: int = Query(default=5, ge=1, le=20),
     draw_time: str | None = Query(default=None, description="Filter to a specific draw time, e.g. '14:00'"),
-    method: Literal["ml", "uniform", "hybrid"] = Query(default="ml", description=(
-        "hybrid = ml_count numbers from the ML scores + the rest from lucky-number sources")),
+    method: Literal["ml", "uniform", "hybrid"] = Query(default="hybrid", description=(
+        "hybrid (standard) = ml_count numbers from the ML scores + the rest from lucky-number "
+        "sources; ml and uniform are comparison baselines")),
     draw_date: date | None = Query(default=None, description="Draw date for lucky numbers; default next draw"),
     ml_count: int | None = Query(default=None, ge=0, description="Hybrid: numbers taken from ML (default picks // 2)"),
     birthdate: date | None = Query(default=None, description="Hybrid: optional birth date for personal numbers"),
     lucky_numbers: str | None = Query(default=None, description="Hybrid: your own lucky numbers, e.g. '7,23,41'"),
+    ai_lucky: bool = Query(default=False, description=(
+        "Hybrid: ask Azure AI for the draw date's lucky numbers; the lucky half is drawn from its shortlist")),
 ) -> dict:
     """Return historical heat maps and seeded local generation metadata.
 
@@ -114,6 +131,9 @@ def get_probability(
         "draw_date": draw_date, "ml_count": ml_count, "birthdate": birthdate,
         "extra_numbers": lucky.parse_extra_numbers(lucky_numbers or "", game_cfg),
     } if method == "hybrid" else None
+    if hybrid is not None and ai_lucky:
+        hybrid["ai_numbers"] = _ai_lucky_numbers(game_cfg, draw_date or lucky.next_draw_date(game_cfg),
+                                                 birthdate)
     if method in ("ml", "hybrid") and len(game_cfg.draw_times) > 1 and draw_time is None:
         for slot in game_cfg.draw_times:
             if df["draw_time"].eq(slot).any():
@@ -146,7 +166,7 @@ def get_probability(
 
 class AISummaryRequest(BaseModel):
     window: int | None = Field(default=None, gt=0)
-    method: Literal["ml", "uniform", "hybrid"] = "ml"
+    method: Literal["ml", "uniform", "hybrid"] = "hybrid"
     n_suggestions: int = Field(default=5, ge=1, le=20)
     # Hybrid only: lucky-number inputs (see /probability).
     draw_date: date | None = None

@@ -18,7 +18,7 @@ from .analysis import AnalysisResult
 from .crowd import DEFAULT_CROWD_QUANTILE, CrowdModel, crowd_avoiding_tickets
 from .games import GameConfig
 from .lucky import (build_hybrid_tickets, default_ml_count, lucky_scores, lucky_tickets,
-                    next_draw_date, scores_to_weights)
+                    scores_to_weights)
 
 MIN_HISTORY = 60
 STRATEGY_LABELS = {
@@ -252,14 +252,12 @@ def run_arena(
 def next_draw_tickets(
     df: pd.DataFrame, cfg: GameConfig, strategy: str, n: int = 5,
     draw_time: str | None = None, crowd: CrowdModel | None = None,
-    ml_window: int = 400, seed: int = 42, draw_date=None, ml_count: int | None = None,
-    birthdate=None, extra_numbers=(), ai_numbers=None,
+    ml_window: int = 400, seed: int = 42,
 ) -> list[list[int]]:
-    """Tickets from one strategy for the upcoming draw, using all history.
+    """Tickets from one comparison strategy for the upcoming draw, using all history.
 
-    draw_date (default: the next scheduled draw), ml_count, birthdate and
-    extra_numbers feed the lucky-number strategies; see next_draw_hybrid_tickets
-    for the ML and lucky halves of each hybrid ticket."""
+    These are the baselines the Arena scores. The standard recipe (half ML, half
+    lucky numbers) is built by tickets.generate_tickets, not here."""
     clean = clean_history(df, cfg, draw_time)
     if len(clean) < MIN_HISTORY:
         raise ValueError(f"Need at least {MIN_HISTORY} usable draws; found {len(clean)}.")
@@ -275,14 +273,6 @@ def next_draw_tickets(
         return sample_tickets(cfg, _weight_matrix(cfg, _counts(matrix, cfg, 100) + 1), n, rng)
     if strategy == "overdue":
         return sample_tickets(cfg, _weight_matrix(cfg, _gaps(matrix, cfg) + 1), n, rng)
-    if strategy == "lucky":
-        day = lucky_scores(cfg, draw_date or next_draw_date(cfg), birthdate=birthdate,
-                           extra_numbers=extra_numbers, ai_numbers=ai_numbers)
-        return lucky_tickets(cfg, day, n, rng)
-    if strategy == "hybrid":
-        return [t["numbers"] for t in next_draw_hybrid_tickets(
-            df, cfg, n, draw_time, ml_window, seed, draw_date, ml_count, birthdate, extra_numbers,
-            ai_numbers)]
     ml = _ml_weights(clean, cfg, len(clean), ml_window, draw_time)
     if strategy == "ml":
         return sample_tickets(cfg, ml, n, rng)
@@ -291,29 +281,6 @@ def next_draw_tickets(
                                       weights=ml[0] if strategy == "ml_crowd" else None,
                                       quantile=DEFAULT_CROWD_QUANTILE)
     raise ValueError(f"Strategy {strategy!r} is unavailable for {cfg.name}.")
-
-
-def next_draw_hybrid_tickets(
-    df: pd.DataFrame, cfg: GameConfig, n: int = 5, draw_time: str | None = None,
-    ml_window: int = 400, seed: int = 42, draw_date=None, ml_count: int | None = None,
-    birthdate=None, extra_numbers=(), ai_numbers=None,
-) -> list[dict]:
-    """Hybrid tickets for the upcoming draw as {"numbers", "ml", "lucky", "ml_scores"} dicts.
-
-    Same procedure as next_draw_tickets(..., "hybrid") and the Arena's hybrid strategy."""
-    clean = clean_history(df, cfg, draw_time)
-    if len(clean) < MIN_HISTORY:
-        raise ValueError(f"Need at least {MIN_HISTORY} usable draws; found {len(clean)}.")
-    rng = np.random.default_rng([seed, list(STRATEGY_LABELS).index("hybrid")])
-    day = lucky_scores(cfg, draw_date or next_draw_date(cfg), birthdate=birthdate,
-                       extra_numbers=extra_numbers, ai_numbers=ai_numbers)
-    ml = _ml_weights(clean, cfg, len(clean), ml_window, draw_time)
-    count = default_ml_count(cfg) if ml_count is None else ml_count
-    tickets = build_hybrid_tickets(cfg, ml, day, n, count, rng)
-    for ticket in tickets:  # the ML score behind each ML number (marginal probability)
-        ticket["ml_scores"] = [float(ml[pos if cfg.ordered else 0, v - cfg.low_boundary])
-                               for pos, v in enumerate(ticket["ml"])]
-    return tickets
 
 
 def ai_shortlist(
