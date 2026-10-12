@@ -1,0 +1,23 @@
+# Dependencies for the Streamlit dashboard (deployed from dashboard/app.py).
+# Streamlit Community Cloud reads this file in preference to the repo-root requirements.txt, which also
+# carries the API, tests and research extras. Ranges (not exact pins) for the packages whose old pins
+# have no wheels on Python 3.14: pandas, numpy, scipy, statsmodels, duckdb, lxml.
+streamlit==1.40.2
+pandas>=2.3.3,<3
+numpy>=2.3.2,<3
+scipy>=1.16.2
+statsmodels>=0.14.5
+scikit-learn>=1.5.0
+plotly==5.24.1
+duckdb>=1.4.0
+openai>=1.40.0
+python-dotenv>=1.0.0
+
+# Scraper used by the "Update Data" sidebar and the startup refresh
+httpx==0.27.2
+beautifulsoup4==4.12.3
+lxml>=6.0.0
+curl-cffi>=0.7.0
+
+# Optional "Import from Kaggle" sidebar panel
+kagglehub>=0.3.0
